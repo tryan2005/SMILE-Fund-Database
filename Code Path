@@ -1,0 +1,138 @@
+import sqlite3, pandas as pd
+
+# make a file-backed DB so it persists between sessions
+con = sqlite3.connect("smilefund.db")
+cur = con.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS dim_company (
+  company_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cik TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  ticker TEXT,
+  sector TEXT,
+  industry TEXT,
+  fiscal_year_end_month INTEGER CHECK (fiscal_year_end_month BETWEEN 1 AND 12)
+);
+""")
+
+cur.executemany("""
+INSERT INTO dim_company (cik, name, ticker, sector, industry, fiscal_year_end_month)
+VALUES (?, ?, ?, ?, ?, ?)
+""", [
+ ('0001652044','Alphabet Inc.','GOOG','Communication Services','Interactive Media & Services',12),
+ ('0000789019','Microsoft Corporation','MSFT','Technology','Software—Infrastructure',6),
+ ('0000320193','Apple Inc.','AAPL','Technology','Technology Hardware',9),
+])
+
+con.commit()
+
+# inspect
+pd.read_sql_query("SELECT * FROM dim_company ORDER BY company_id;", con)
+%pip install psycopg2-binary SQLAlchemy pandas
+import os
+os.chdir("C:/Users/VTN183/OneDrive - University of Tennessee/smilefund_project/")
+
+import os
+import pandas as pd
+
+proj = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project"
+os.makedirs(os.path.join(proj, "warehouse", "parquet"), exist_ok=True)
+base = os.path.join(proj, "warehouse", "parquet")
+base
+
+import pandas as pd
+
+dim_company = pd.DataFrame([
+    {"company_id": 1, "cik": "0001652044", "name": "Alphabet Inc.", "ticker": "GOOG",
+     "sector": "Communication Services", "industry": "Interactive Media & Services",
+     "fiscal_year_end_month": 12},
+    {"company_id": 2, "cik": "0000789019", "name": "Microsoft Corporation", "ticker": "MSFT",
+     "sector": "Technology", "industry": "Software—Infrastructure",
+     "fiscal_year_end_month": 6},
+    {"company_id": 3, "cik": "0000320193", "name": "Apple Inc.", "ticker": "AAPL",
+     "sector": "Technology", "industry": "Technology Hardware",
+     "fiscal_year_end_month": 9},
+])
+
+# (optional) set explicit dtypes; helpful later
+dim_company = dim_company.astype({
+    "company_id": "int64",
+    "cik": "string",
+    "name": "string",
+    "ticker": "string",
+    "sector": "string",
+    "industry": "string",
+    "fiscal_year_end_month": "int64",
+})
+path_company = os.path.join(base, "dim_company.parquet")
+dim_company.to_parquet(path_company, index=False, engine="pyarrow")
+pd.read_parquet(path_company)
+dim_calendar = pd.DataFrame([
+    {"calendar_id": 1, "date": "2023-03-31", "fiscal_year": 2023, "fiscal_quarter": "Q1", "fiscal_month": 3, "period_type": "QTR"},
+    {"calendar_id": 2, "date": "2023-06-30", "fiscal_year": 2023, "fiscal_quarter": "Q2", "fiscal_month": 6, "period_type": "QTR"},
+    {"calendar_id": 3, "date": "2023-09-30", "fiscal_year": 2023, "fiscal_quarter": "Q3", "fiscal_month": 9, "period_type": "QTR"},
+    {"calendar_id": 4, "date": "2023-12-31", "fiscal_year": 2023, "fiscal_quarter": "Q4", "fiscal_month": 12, "period_type": "FY"},
+]).astype({
+    "calendar_id": "int64","date": "string","fiscal_year": "int64","fiscal_quarter": "string",
+    "fiscal_month": "int64","period_type": "string"
+})
+
+path_calendar = os.path.join(base, "dim_calendar.parquet")
+dim_calendar.to_parquet(path_calendar, index=False)
+pd.read_parquet(path_calendar)
+dim_metric = pd.DataFrame([
+    {"metric_id": 1, "metric_name": "Revenue", "xbrl_tag": "Revenues", "normal_balance": "Credit"},
+    {"metric_id": 2, "metric_name": "Net Income", "xbrl_tag": "NetIncomeLoss", "normal_balance": "Credit"},
+    {"metric_id": 3, "metric_name": "Total Assets", "xbrl_tag": "Assets", "normal_balance": "Debit"},
+]).astype({"metric_id":"int64","metric_name":"string","xbrl_tag":"string","normal_balance":"string"})
+
+path_metric = os.path.join(base, "dim_metric.parquet")
+dim_metric.to_parquet(path_metric, index=False)
+pd.read_parquet(path_metric)
+dim_filing = pd.DataFrame([
+    {"filing_id": 1, "form_type": "10-K", "filing_date": "2024-02-03",
+     "accepted_date": "2024-02-03", "period_end_date": "2023-12-31",
+     "accession_number": "0001652044-24-000050", "filing_url": "https://..."},
+]).astype({
+    "filing_id":"int64","form_type":"string","filing_date":"string","accepted_date":"string",
+    "period_end_date":"string","accession_number":"string","filing_url":"string"
+})
+
+path_filing = os.path.join(base, "dim_filing.parquet")
+dim_filing.to_parquet(path_filing, index=False)
+pd.read_parquet(path_filing)
+dim_unit = pd.DataFrame([
+    {"unit_id":1,"unit_code":"USD","category":"currency","iso_currency":"USD","decimals_hint":2,"description":"U.S. dollars"},
+    {"unit_id":2,"unit_code":"shares","category":"shares","iso_currency":None,"decimals_hint":0,"description":"Common shares"},
+    {"unit_id":3,"unit_code":"USD_per_share","category":"per_share","iso_currency":"USD","decimals_hint":2,"description":"Dollars per share"},
+]).astype({"unit_id":"int64","unit_code":"string","category":"string","iso_currency":"string",
+          "decimals_hint":"int64","description":"string"})
+
+path_unit = os.path.join(base, "dim_unit.parquet")
+dim_unit.to_parquet(path_unit, index=False)
+pd.read_parquet(path_unit)
+fact_financials = pd.DataFrame([
+    {"financial_id": 1, "company_id": 1, "metric_id": 1, "calendar_id": 4,
+     "value": 307394000000.00, "unit_id": 1, "filing_id": 1, "consolidated_flag": "Consolidated"},
+    {"financial_id": 2, "company_id": 1, "metric_id": 2, "calendar_id": 4,
+     "value": 73795000000.00, "unit_id": 1, "filing_id": 1, "consolidated_flag": "Consolidated"},
+]).astype({
+    "financial_id":"int64","company_id":"int64","metric_id":"int64","calendar_id":"int64",
+    "value":"float64","unit_id":"int64","filing_id":"int64","consolidated_flag":"string"
+})
+
+path_fin = os.path.join(base, "fact_financials.parquet")
+fact_financials.to_parquet(path_fin, index=False)
+pd.read_parquet(path_fin)
+fact_holdings = pd.DataFrame([
+    {"holding_id":1,"company_id":1,"asof_date":"2025-03-31","weight":0.04200,"shares":145,"market_value":30200,"source":"SMILE_FUND"},
+    {"holding_id":2,"company_id":2,"asof_date":"2025-03-31","weight":0.03800,"shares":110,"market_value":29000,"source":"SMILE_FUND"},
+]).astype({
+    "holding_id":"int64","company_id":"int64","asof_date":"string","weight":"float64",
+    "shares":"float64","market_value":"float64","source":"string"
+})
+
+path_hold = os.path.join(base, "fact_holdings.parquet")
+fact_holdings.to_parquet(path_hold, index=False)
+pd.read_parquet(path_hold)
