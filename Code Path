@@ -136,3 +136,236 @@ fact_holdings = pd.DataFrame([
 path_hold = os.path.join(base, "fact_holdings.parquet")
 fact_holdings.to_parquet(path_hold, index=False)
 pd.read_parquet(path_hold)
+import pandas as pd
+
+path = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project\data\Approved List 9.14.25(Approved List 9.14.csv"
+df = pd.read_csv(path)
+df.head()
+import os, pandas as pd
+base = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project\warehouse\parquet"
+path_company  = os.path.join(base, "dim_company.parquet")
+path_holdings = os.path.join(base, "fact_holdings.parquet")
+csv_path = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project\data\Approved List 9.14.25(Approved List 9.14.csv"
+df = pd.read_csv(csv_path)
+
+# lower/strip col names
+df.columns = [c.strip().lower() for c in df.columns]
+
+# map common variants to our target names
+RENAME_MAP = {
+    "ticker": "ticker",
+    "symbol": "ticker",
+    "company": "name",
+    "company name": "name",
+    "name": "name",
+    "sector": "sector",
+    "gics sector": "sector",
+    "weight": "weight",
+    "weight %": "weight",
+    "portfolio weight": "weight",
+    "asof": "asof_date",
+    "as_of": "asof_date",
+    "as of": "asof_date",
+    "date": "asof_date"
+}
+
+df = df.rename(columns={c: RENAME_MAP.get(c, c) for c in df.columns})
+
+# keep only the columns we know how to use (others are ignored for now)
+keep_cols = [c for c in ["ticker","name","sector","weight","asof_date"] if c in df.columns]
+df = df[keep_cols].copy()
+df.head()
+import pandas as pd
+import re
+
+# df already loaded with a 'ticker' column
+tickers_raw = df["ticker"].astype(str)
+
+def normalize_ticker(s: str) -> str:
+    s = s.strip().upper()
+    s = s.replace(" ", "")
+    # convert share-class separator "/" to "." (e.g., BRK/B -> BRK.B)
+    s = re.sub(r"/", ".", s)
+    return s
+
+df["ticker_norm"] = tickers_raw.map(normalize_ticker)
+
+# show before/after for first few rows
+preview = df[["ticker", "ticker_norm"]].head(10)
+preview
+import os, pandas as pd
+
+base = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project\warehouse\parquet"
+path_company = os.path.join(base, "dim_company.parquet")
+
+# if the file exists, load it; else start empty with the right columns
+if os.path.exists(path_company):
+    dim_company = pd.read_parquet(path_company)
+else:
+    dim_company = pd.DataFrame(columns=[
+        "company_id","cik","name","ticker","sector","industry","fiscal_year_end_month"
+    ])
+    dim_company = dim_company.astype({
+        "company_id":"int64", "cik":"string","name":"string","ticker":"string",
+        "sector":"string","industry":"string","fiscal_year_end_month":"float64"
+    })
+
+dim_company.head()
+# make sure we have the normalized ticker column from the prior step
+assert "ticker_norm" in df.columns, "Run the normalization step first."
+
+# unique tickers from your CSV
+incoming = (df[["ticker_norm"]]
+            .dropna()
+            .drop_duplicates()
+            .rename(columns={"ticker_norm":"ticker"}))
+
+# left-join to see which are missing from dim_company
+check = incoming.merge(dim_company[["ticker","company_id"]], on="ticker", how="left")
+to_add = check[check["company_id"].isna()].drop(columns=["company_id"]).copy()
+
+print(f"New tickers to add: {len(to_add)}")
+to_add.head(20)
+if len(to_add) > 0:
+    # next sequential company_id
+    next_id = (dim_company["company_id"].max() + 1) if len(dim_company) else 1
+    new_ids = list(range(next_id, next_id + len(to_add)))
+
+    n = len(to_add)  # store length once
+
+    new_rows = pd.DataFrame({
+        "company_id": new_ids,
+        "cik": ["" for _ in range(n)],
+        "name": ["" for _ in range(n)],
+        "ticker": to_add["ticker"].astype("string"),
+        "sector": ["" for _ in range(n)],
+        "industry": ["" for _ in range(n)],
+        "fiscal_year_end_month": [None for _ in range(n)]
+    })
+
+    dim_company = pd.concat([dim_company, new_rows], ignore_index=True)
+    dim_company = dim_company.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
+
+    dim_company.to_parquet(path_company, index=False)
+
+# reload to confirm
+dim_company = pd.read_parquet(path_company)
+print(f"dim_company rows: {len(dim_company)}")
+dim_company.tail(10)
+import pandas as pd
+import os
+from datetime import date
+
+base = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project\warehouse\parquet"
+path_company  = os.path.join(base, "dim_company.parquet")
+path_holdings = os.path.join(base, "fact_holdings.parquet")
+
+# 1) reload company dim (has company_id + ticker)
+dim_company = pd.read_parquet(path_company)[["company_id","ticker"]]
+
+# 2) make a clean ticker list from your dataframe (the one with ticker_norm)
+assert "ticker_norm" in df.columns, "Run the normalization step first."
+tickers = (df[["ticker_norm"]]
+           .dropna()
+           .drop_duplicates()
+           .rename(columns={"ticker_norm":"ticker"}))
+
+# 3) attach company_id to each ticker
+hold = tickers.merge(dim_company, on="ticker", how="left")
+
+# 4) add minimal holding fields
+asof = "2025-03-31"   # ← set the date you want (or str(date.today()))
+preview_holdings = pd.DataFrame({
+    "company_id": hold["company_id"].astype("Int64"),  # allow nulls to show if any missing
+    "asof_date":  asof,
+    "weight":     pd.NA,        # will fill later
+    "shares":     pd.NA,
+    "market_value": pd.NA,
+    "source":     "SMILE_FUND"
+})
+
+preview_holdings.head(10)
+# load existing file if present
+if os.path.exists(path_holdings):
+    existing = pd.read_parquet(path_holdings)
+else:
+    existing = pd.DataFrame(columns=[
+        "holding_id","company_id","asof_date","weight","shares","market_value","source"
+    ])
+
+# build new block with temporary ids
+new_block = preview_holdings.copy()
+new_block = new_block.astype({
+    "company_id":"int64",
+    "asof_date":"string",
+    "source":"string"
+})
+
+# combine and assign holding_id sequentially
+combined = pd.concat([existing, new_block], ignore_index=True)
+
+# de-dup just in case (one row per company per as-of date)
+combined = combined.drop_duplicates(subset=["company_id","asof_date"], keep="last").reset_index(drop=True)
+
+combined["holding_id"] = range(1, len(combined)+1)
+
+# save
+combined.to_parquet(path_holdings, index=False)
+
+# quick look
+pd.read_parquet(path_holdings).head(12)
+import os, pandas as pd
+
+base = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project\warehouse\parquet"
+out_dir = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project\outputs"
+os.makedirs(out_dir, exist_ok=True)
+
+path_company  = os.path.join(base, "dim_company.parquet")
+path_holdings = os.path.join(base, "fact_holdings.parquet")
+
+dim_company = pd.read_parquet(path_company)[["company_id","ticker","name","sector","industry"]]
+holdings    = pd.read_parquet(path_holdings)
+
+review = (holdings
+          .merge(dim_company, on="company_id", how="left")
+          .sort_values(["asof_date","ticker"]))
+
+# quick on-screen check
+review.head(15)
+print("rows:", len(review), "| unique companies:", review["company_id"].nunique())
+
+# save for eyeballing in Excel
+review_csv = os.path.join(out_dir, "holdings_review.csv")
+review_parq = os.path.join(out_dir, "holdings_review.parquet")
+review.to_csv(review_csv, index=False)
+review.to_parquet(review_parq, index=False)
+print("Wrote:", review_csv)
+import os, pandas as pd
+
+proj_base = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project"
+parq_base = os.path.join(proj_base, "warehouse", "parquet")
+os.makedirs(parq_base, exist_ok=True)
+
+path_filing   = os.path.join(parq_base, "dim_filing.parquet")
+
+# create if missing
+if not os.path.exists(path_filing):
+    dim_filing = pd.DataFrame(columns=[
+        "filing_id","form_type","filing_date","accepted_date",
+        "period_end_date","accession_number","filing_url"
+    ]).astype({
+        "filing_id":"int64","form_type":"string","filing_date":"string","accepted_date":"string",
+        "period_end_date":"string","accession_number":"string","filing_url":"string"
+    })
+    dim_filing.to_parquet(path_filing, index=False)
+else:
+    dim_filing = pd.read_parquet(path_filing)
+
+dim_filing.tail(3)
+import os, glob
+
+base_path = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project\data\sec\company_facts"
+files = glob.glob(os.path.join(base_path, "*.json"))
+
+print(f"Found {len(files):,} JSON files")
+print("Example:", files[:3])
