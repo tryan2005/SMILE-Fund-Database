@@ -721,3 +721,673 @@ fact_fin["financial_id"] = range(1, len(fact_fin)+1)
 fact_fin.to_parquet(path_fact, index=False)
 
 print("Added/updated Net Income row. Rows now:", len(fact_fin))
+import os
+
+parq_base = "parq_base"   # or any path you prefer, e.g., "C:/SMILEFund/parq_base"
+os.makedirs(parq_base, exist_ok=True)
+print(f"Parquet base folder created at: {os.path.abspath(parq_base)}")
+import pandas as pd, os, json
+
+parq = "parq_base"  # <- your folder
+
+metric_pref = pd.DataFrame([
+    # Revenue family
+    ("RevenueStandard", "us-gaap:Revenues", 1),
+    ("RevenueStandard", "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax", 2),
+    ("RevenueStandard", "us-gaap:SalesRevenueNet", 3),
+    ("RevenueStandard", "us-gaap:SalesRevenueGoodsNet", 4),
+    ("RevenueStandard", "us-gaap:SalesRevenueServicesNet", 5),
+    # Net income family (already in your fact table but keep for symmetry)
+    ("NetIncomeStandard", "us-gaap:NetIncomeLoss", 1),
+], columns=["metric_standard", "xbrl_tag", "pref_rank"])
+
+metric_pref.to_parquet(os.path.join(parq, "dim_metric_preference.parquet"), index=False)
+import os
+
+PROJ = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project"
+PARQ = os.path.join(PROJ, "warehouse", "parquet")
+os.makedirs(PARQ, exist_ok=True)
+
+print("PARQ =", PARQ)
+import pandas as pd, os
+
+metric_pref = pd.DataFrame([
+    # Revenue family (lower rank = more preferred)
+    ("RevenueStandard", "Revenues", 1),
+    ("RevenueStandard", "RevenueFromContractWithCustomerExcludingAssessedTax", 2),
+    ("RevenueStandard", "SalesRevenueNet", 3),
+    ("RevenueStandard", "SalesRevenueGoodsNet", 4),
+    ("RevenueStandard", "SalesRevenueServicesNet", 5),
+
+    # Net income family
+    ("NetIncomeStandard", "NetIncomeLoss", 1),
+], columns=["metric_standard", "xbrl_tag", "pref_rank"])
+
+metric_pref_path = os.path.join(PARQ, "dim_metric_preference.parquet")
+metric_pref.to_parquet(metric_pref_path, index=False)
+metric_pref.head()
+import pandas as pd, os
+
+# Inputs
+fact_path   = os.path.join(PARQ, "fact_financials.parquet")
+metric_path = os.path.join(PARQ, "dim_metric.parquet")
+cal_path    = os.path.join(PARQ, "dim_calendar.parquet")
+co_path     = os.path.join(PARQ, "dim_company.parquet")
+unit_path   = os.path.join(PARQ, "dim_unit.parquet")
+filing_path = os.path.join(PARQ, "dim_filing.parquet")
+pref_path   = os.path.join(PARQ, "dim_metric_preference.parquet")
+
+fact = pd.read_parquet(fact_path)
+dim_metric = pd.read_parquet(metric_path)[["metric_id","xbrl_tag","metric_name"]]
+dim_calendar = pd.read_parquet(cal_path)[["calendar_id","date","fiscal_year","period_type"]]
+dim_company = pd.read_parquet(co_path)[["company_id","ticker","cik"]]
+dim_unit = pd.read_parquet(unit_path) if os.path.exists(unit_path) else pd.DataFrame(columns=["unit_id","unit_code"])
+metric_pref = pd.read_parquet(pref_path)
+
+if os.path.exists(filing_path):
+    dim_filing_raw = pd.read_parquet(filing_path)
+    # normalize filing date col to a common name
+    if "filed_date" in dim_filing_raw.columns:
+        dim_filing = dim_filing_raw[["filing_id","filed_date","form_type" if "form_type" in dim_filing_raw.columns else "form"]]
+    else:
+        # your dim_filing uses filing_date/form_type
+        dim_filing = dim_filing_raw.rename(columns={"filing_date":"filed_date"})[
+            ["filing_id","filed_date","form_type" if "form_type" in dim_filing_raw.columns else "form"]
+        ]
+else:
+    dim_filing = pd.DataFrame(columns=["filing_id","filed_date","form_type"])
+
+# Join everything
+df = (fact
+      .merge(dim_metric, on="metric_id", how="left")
+      .merge(metric_pref, on="xbrl_tag", how="left")        # <-- matches your tag names
+      .merge(dim_calendar, on="calendar_id", how="left")
+      .merge(dim_company, on="company_id", how="left")
+      .merge(dim_filing, on="filing_id", how="left"))
+
+# Keep only metrics we’re standardizing
+df = df[df["metric_standard"].notna()].copy()
+
+# Tie-breakers
+df["is_consolidated"] = (df.get("consolidated_flag","").astype(str).str.lower()=="consolidated").astype(int)
+# Prefer USD: your dim_unit has unit_id=1 for USD
+usd_unit_ids = set(dim_unit.loc[dim_unit["unit_code"].str.upper()=="USD", "unit_id"]) if "unit_code" in dim_unit.columns else {1}
+df["is_usd"] = df["unit_id"].isin(usd_unit_ids).astype(int)
+df["filed_date"] = pd.to_datetime(df.get("filed_date"))
+
+# Sort (best first), then de-dup to keep the winner per company×period×metric_standard
+df = df.sort_values([
+    "company_id","calendar_id","metric_standard",
+    "pref_rank",        # lower is better
+    "is_consolidated",  # consolidated preferred
+    "is_usd",           # USD preferred
+    "filed_date"        # latest preferred
+], ascending=[True,True,True, True, False, False, False])
+
+std = (df
+       .drop_duplicates(["company_id","calendar_id","metric_standard"], keep="first")
+       .rename(columns={"value":"value_numeric"})
+       [["company_id","calendar_id","metric_standard","value_numeric",
+         "ticker","cik","fiscal_year","period_type","date"]])
+
+# Persist
+std_path = os.path.join(PARQ, "fact_financials_standard.parquet")
+std.to_parquet(std_path, index=False)
+
+# QA
+assert not std.duplicated(["company_id","calendar_id","metric_standard"]).any()
+print("Standardized rows:", len(std))
+print(std.pivot_table(index="metric_standard", values="value_numeric", aggfunc="count"))
+
+# Wide convenience view
+wide = (std
+        .pivot_table(index=["company_id","calendar_id","ticker","cik","fiscal_year","period_type","date"],
+                     columns="metric_standard", values="value_numeric", aggfunc="first")
+        .reset_index())
+wide.columns.name = None
+wide_path = os.path.join(PARQ, "vw_financials_wide.parquet")
+wide.to_parquet(wide_path, index=False)
+print("Wrote wide view:", wide_path, "rows:", len(wide))
+co_raw = pd.read_parquet(paths["dim_company"])
+if "ticker" not in co_raw.columns:
+    co_raw["ticker"] = pd.NA  # add empty ticker column
+    co_raw.to_parquet(paths["dim_company"], index=False)
+    print("Added empty 'ticker' column to dim_company.")
+import os, pandas as pd
+
+# --- Paths
+PROJ = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project"
+PARQ = os.path.join(PROJ, "warehouse", "parquet")
+
+path_hold = os.path.join(PARQ, "fact_holdings.parquet")
+path_wide = os.path.join(PARQ, "vw_financials_wide.parquet")
+path_co   = os.path.join(PARQ, "dim_company.parquet")
+out_path  = os.path.join(PARQ, "vw_holdings_with_financials.parquet")
+
+# --- Helpers
+def safe_select(df, cols):
+    have = [c for c in cols if c in df.columns]
+    return df[have].copy()
+
+# --- Load
+hold = pd.read_parquet(path_hold)          # expects company_id, asof_date, weight...
+finw = pd.read_parquet(path_wide)          # has company_id, date, RevenueStandard/NetIncomeStandard, maybe ticker
+co   = pd.read_parquet(path_co)            # has company_id, maybe ticker/name/sector/industry
+
+# Ensure datetimes
+finw["date"] = pd.to_datetime(finw["date"])
+hold["asof_date"] = pd.to_datetime(hold["asof_date"])
+
+# --- Pick most recent financial period per company <= portfolio as-of max
+asof_max = hold["asof_date"].max()
+finw_recent = (finw[finw["date"] <= asof_max]
+               .sort_values(["company_id","date"])
+               .groupby("company_id", as_index=False)
+               .tail(1)
+               .copy())
+
+# Add company meta if missing from finw
+meta_want = ["ticker","name","sector","industry"]
+meta_to_add = [c for c in meta_want if c not in finw_recent.columns and c in co.columns]
+if meta_to_add:
+    finw_recent = finw_recent.merge(safe_select(co, ["company_id"] + meta_to_add),
+                                    on="company_id", how="left")
+
+# Build the final dataset (only keep columns that exist)
+metric_cols = [c for c in ["RevenueStandard","NetIncomeStandard"] if c in finw_recent.columns]
+latest_fin = safe_select(finw_recent, ["company_id","date"] + metric_cols + [c for c in meta_want if c in finw_recent.columns])
+latest_fin = latest_fin.rename(columns={"date":"fin_period_end"})
+
+# Merge onto holdings
+hold_fin = hold.merge(latest_fin, on="company_id", how="left", suffixes=("","_fin"))
+
+# Save
+hold_fin.to_parquet(out_path, index=False)
+print(f"✅ Wrote: {out_path} | rows: {len(hold_fin)}")
+
+# Peek
+hold_fin.head(10)
+# Compute TTM Revenue and attach to holdings (robust to FY-only data)
+finw = pd.read_parquet(path_wide).copy()
+finw["date"] = pd.to_datetime(finw["date"])
+
+rev = finw[["company_id","date","period_type","RevenueStandard"]].dropna()
+q = rev[rev["period_type"].str.upper().eq("QTR")].sort_values(["company_id","date"]).copy()
+a = rev[rev["period_type"].str.upper().eq("FY")].sort_values(["company_id","date"]).copy()
+
+# Rolling 4q TTM
+q["rev_ttm_from_quarters"] = q.groupby("company_id")["RevenueStandard"]\
+                               .rolling(4, min_periods=4).sum().reset_index(level=0, drop=True)
+
+# Latest FY as fallback
+a["rev_fy_latest"] = a.groupby("company_id")["RevenueStandard"].cummax()
+
+# Align on dates (inner/outer union), then choose quarters TTM else FY
+ttm = (q[["company_id","date","rev_ttm_from_quarters"]]
+       .merge(a[["company_id","date","rev_fy_latest"]], on=["company_id","date"], how="outer")
+       .sort_values(["company_id","date"]))
+ttm["revenue_ttm"] = ttm["rev_ttm_from_quarters"].fillna(ttm["rev_fy_latest"])
+
+# For each company, pick latest TTM <= holdings as-of max
+asof_max = pd.read_parquet(path_hold)["asof_date"].pipe(pd.to_datetime).max()
+ttm_latest = (ttm[ttm["date"] <= asof_max]
+              .groupby("company_id", as_index=False)
+              .tail(1)[["company_id","revenue_ttm"]])
+
+# Attach to holdings-with-financials and save
+hold_fin = pd.read_parquet(out_path)
+hold_fin_ttm = hold_fin.merge(ttm_latest, on="company_id", how="left")
+out_ttm = os.path.join(PARQ, "vw_holdings_with_ttm.parquet")
+hold_fin_ttm.to_parquet(out_ttm, index=False)
+print(f"✅ Wrote: {out_ttm} | rows: {len(hold_fin_ttm)}")
+hold_fin_ttm.head(10)
+import os, json, pandas as pd
+from glob import glob
+from datetime import datetime
+
+PROJ = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project"
+PARQ = os.path.join(PROJ, "warehouse", "parquet")
+FACTS = os.path.join(PROJ, "data", "sec", "company_facts")
+os.makedirs(PARQ, exist_ok=True)
+
+# ---------- load or initialize dims/fact ----------
+def read_or_empty(path, cols, dtypes):
+    if os.path.exists(path):
+        return pd.read_parquet(path)
+    df = pd.DataFrame(columns=cols).astype(dtypes)
+    df.to_parquet(path, index=False)
+    return df
+
+path_company = os.path.join(PARQ, "dim_company.parquet")
+path_metric  = os.path.join(PARQ, "dim_metric.parquet")
+path_unit    = os.path.join(PARQ, "dim_unit.parquet")
+path_cal     = os.path.join(PARQ, "dim_calendar.parquet")
+path_filing  = os.path.join(PARQ, "dim_filing.parquet")
+path_fact    = os.path.join(PARQ, "fact_financials.parquet")
+
+dim_company = read_or_empty(path_company,
+    ["company_id","cik","name","ticker","sector","industry","fiscal_year_end_month"],
+    {"company_id":"int64","cik":"string","name":"string","ticker":"string",
+     "sector":"string","industry":"string","fiscal_year_end_month":"float64"}
+)
+dim_metric = pd.read_parquet(path_metric) if os.path.exists(path_metric) else pd.DataFrame(
+    columns=["metric_id","metric_name","xbrl_tag","metric_group","normal_balance"]
+).astype({"metric_id":"int64","metric_name":"string","xbrl_tag":"string","metric_group":"string","normal_balance":"string"})
+dim_unit   = read_or_empty(path_unit,
+    ["unit_id","unit_code","category","iso_currency","decimals_hint","description"],
+    {"unit_id":"int64","unit_code":"string","category":"string","iso_currency":"string",
+     "decimals_hint":"float64","description":"string"}
+)
+dim_calendar = read_or_empty(path_cal,
+    ["calendar_id","date","fiscal_year","fiscal_quarter","fiscal_month","period_type"],
+    {"calendar_id":"int64","date":"string","fiscal_year":"int64","fiscal_quarter":"string",
+     "fiscal_month":"int64","period_type":"string"}
+)
+dim_filing = read_or_empty(path_filing,
+    ["filing_id","form_type","filing_date","accepted_date","period_end_date","accession_number","filing_url"],
+    {"filing_id":"int64","form_type":"string","filing_date":"string","accepted_date":"string",
+     "period_end_date":"string","accession_number":"string","filing_url":"string"}
+)
+fact_fin = read_or_empty(path_fact,
+    ["financial_id","company_id","metric_id","calendar_id","value","unit_id","filing_id","consolidated_flag"],
+    {"financial_id":"int64","company_id":"int64","metric_id":"int64","calendar_id":"int64",
+     "value":"float64","unit_id":"int64","filing_id":"int64","consolidated_flag":"string"}
+)
+
+# ---------- ensure-* helpers (in-cell so it runs standalone) ----------
+def ensure_company_by_cik(cik_str, name=""):
+    global dim_company
+    hit = dim_company.loc[dim_company["cik"]==cik_str]
+    if not hit.empty:
+        return int(hit.iloc[0]["company_id"])
+    next_id = (dim_company["company_id"].max()+1) if len(dim_company) else 1
+    row = {"company_id":next_id,"cik":cik_str,"name":name or "", "ticker":pd.NA,
+           "sector":pd.NA,"industry":pd.NA,"fiscal_year_end_month":pd.NA}
+    dim_company = pd.concat([dim_company, pd.DataFrame([row])], ignore_index=True)
+    dim_company.to_parquet(path_company, index=False)
+    return next_id
+
+def ensure_metric_by_tag(xbrl_tag, metric_name, metric_group, normal_balance):
+    global dim_metric
+    hit = dim_metric.loc[dim_metric["xbrl_tag"]==xbrl_tag]
+    if not hit.empty:
+        return int(hit.iloc[0]["metric_id"])
+    next_id = (dim_metric["metric_id"].max()+1) if len(dim_metric) else 1
+    row = {"metric_id":next_id,"metric_name":metric_name,"xbrl_tag":xbrl_tag,
+           "metric_group":metric_group,"normal_balance":normal_balance}
+    dim_metric = pd.concat([dim_metric, pd.DataFrame([row])], ignore_index=True)
+    dim_metric.to_parquet(path_metric, index=False)
+    return next_id
+
+def ensure_unit(unit_code):
+    global dim_unit
+    hit = dim_unit.loc[dim_unit["unit_code"]==unit_code]
+    if not hit.empty:
+        return int(hit.iloc[0]["unit_id"])
+    next_id = (dim_unit["unit_id"].max()+1) if len(dim_unit) else 1
+    row = {"unit_id":next_id,"unit_code":unit_code,"category":"currency",
+           "iso_currency":unit_code if len(unit_code)==3 else "USD","decimals_hint":pd.NA,"description":""}
+    dim_unit = pd.concat([dim_unit, pd.DataFrame([row])], ignore_index=True)
+    dim_unit.to_parquet(path_unit, index=False)
+    return next_id
+
+def ensure_calendar(period_end, fy, fp, period_type):
+    """fp like 'FY','Q1'...'Q4'. fiscal_month from period_end."""
+    global dim_calendar
+    fiscal_month = int(period_end[5:7])
+    hit = dim_calendar.loc[(dim_calendar["date"]==period_end) & (dim_calendar["period_type"]==period_type)]
+    if not hit.empty:
+        return int(hit.iloc[0]["calendar_id"])
+    next_id = (dim_calendar["calendar_id"].max()+1) if len(dim_calendar) else 1
+    row = {"calendar_id":next_id,"date":period_end,"fiscal_year":int(fy),
+           "fiscal_quarter":fp if period_type=="QTR" else "Q4",
+           "fiscal_month":fiscal_month,"period_type":period_type}
+    dim_calendar = pd.concat([dim_calendar, pd.DataFrame([row])], ignore_index=True)
+    dim_calendar.to_parquet(path_cal, index=False)
+    return next_id
+
+def ensure_filing(form_type, filed_date, period_end, accession=""):
+    global dim_filing
+    hit = dim_filing.loc[
+        (dim_filing["form_type"]==form_type) &
+        (dim_filing["filing_date"]==filed_date) &
+        (dim_filing["period_end_date"]==period_end)
+    ]
+    if accession:
+        hit = dim_filing.loc[dim_filing["accession_number"]==accession] if hit.empty else hit
+    if not hit.empty:
+        return int(hit.iloc[0]["filing_id"])
+    next_id = (dim_filing["filing_id"].max()+1) if len(dim_filing) else 1
+    row = {"filing_id":next_id,"form_type":form_type or "",
+           "filing_date":filed_date or period_end,"accepted_date":filed_date or period_end,
+           "period_end_date":period_end,"accession_number":accession or "","filing_url":""}
+    dim_filing = pd.concat([dim_filing, pd.DataFrame([row])], ignore_index=True)
+    dim_filing.to_parquet(path_filing, index=False)
+    return next_id
+
+# ---------- metric families we’ll ingest ----------
+REVENUE_TAGS = [
+    "Revenues",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet",
+    "TotalRevenuesAndOtherIncome","PremiumsEarnedNet","InterestIncomeOperating"
+]
+INCOME_TAGS = [
+    "NetIncomeLoss","ProfitLoss",
+    "IncomeLossFromContinuingOperations",
+    "NetIncomeLossAvailableToCommonStockholdersBasic",
+    "NetIncomeLossAttributableToParent"
+]
+
+def rows_from_tag(obj):
+    """Return list of rows for preferred unit (USD if present else first unit)."""
+    units = obj.get("units", {})
+    if not units: 
+        return None, pd.DataFrame()
+    unit_key = "USD" if "USD" in units else next(iter(units.keys()))
+    return unit_key, pd.DataFrame(units[unit_key])
+
+def fp_to_quarter(fp):
+    fp = (fp or "").upper()
+    if fp in ["Q1","Q2","Q3","Q4"]: return fp, "QTR"
+    if fp in ["FY",""]: return "Q4", "FY"
+    return "Q4","FY"
+
+# ---------- iterate all JSONs ----------
+json_files = sorted(glob(os.path.join(FACTS, "CIK*.json")))
+print(f"Found {len(json_files):,} company_facts files")
+
+new_rows = []
+
+for i, path in enumerate(json_files, 1):
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        print("!! error reading", path, e); 
+        continue
+
+    cik10 = str(data.get("cik","")).zfill(10)
+    entity = data.get("entityName","")
+    co_id = ensure_company_by_cik(cik10, entity)
+
+    usgaap = data.get("facts", {}).get("us-gaap", {})
+
+    # Collect both families present for this company
+    families = [
+        ("Revenue", "Credit", REVENUE_TAGS),
+        ("Net Income", "Credit", INCOME_TAGS)
+    ]
+
+    for metric_name, normal_balance, tag_list in families:
+        # pick the first tag that exists in this file; we will still store the real tag we used
+        tag_used = next((t for t in tag_list if t in usgaap), None)
+        if not tag_used:
+            continue
+
+        unit_key, df = rows_from_tag(usgaap[tag_used])
+        if df.empty: 
+            continue
+
+        # Keep only periodized rows that have fy, fp, end, val
+        cols_need = {"fy","fp","end","val"}
+        df = df[[c for c in df.columns if c in cols_need.union({"form","accn","filed"})]]
+
+        for _, r in df.iterrows():
+            fy = r.get("fy")
+            fp = r.get("fp")
+            end = r.get("end")
+            val = r.get("val")
+            if pd.isna(fy) or pd.isna(fp) or pd.isna(end) or pd.isna(val):
+                continue
+
+            fp_norm, period_type = fp_to_quarter(fp)
+            met_id = ensure_metric_by_tag(tag_used, metric_name=metric_name,
+                                          metric_group=("Revenue" if metric_name=="Revenue" else "Income"),
+                                          normal_balance=normal_balance)
+            unit_id = ensure_unit(unit_key)
+            cal_id  = ensure_calendar(end, int(fy), fp_norm, period_type)
+            fil_id  = ensure_filing(r.get("form",""), r.get("filed", end), end, r.get("accn",""))
+
+            new_rows.append({
+                "company_id": co_id,
+                "metric_id":  met_id,
+                "calendar_id": cal_id,
+                "value": float(val),
+                "unit_id": unit_id,
+                "filing_id": fil_id,
+                "consolidated_flag": "Consolidated"
+            })
+
+    if i % 250 == 0:
+        print(f"...processed {i:,}/{len(json_files):,}")
+
+# Append & de-duplicate by natural key
+if new_rows:
+    incoming = pd.DataFrame(new_rows)
+    if len(fact_fin):
+        start_rows = len(fact_fin)
+        fact_fin = pd.concat([fact_fin.drop(columns=[], errors="ignore"), incoming], ignore_index=True)
+    else:
+        start_rows = 0
+        fact_fin = incoming.copy()
+
+    natural_key = ["company_id","metric_id","calendar_id","filing_id"]
+    fact_fin = fact_fin.drop_duplicates(subset=natural_key, keep="last").reset_index(drop=True)
+    fact_fin["financial_id"] = range(1, len(fact_fin)+1)
+    fact_fin.to_parquet(path_fact, index=False)
+    print(f"✅ Ingested {len(fact_fin)-start_rows:,} new fact rows; total = {len(fact_fin):,}")
+else:
+    print("No new rows found.")
+import os, time, pandas as pd
+try:
+    import orjson as _json; loads = _json.loads
+except Exception:
+    import json as _json; loads = _json.loads
+
+# ---- ONEDRIVE PATHS
+PROJ = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project"
+PARQ = os.path.join(PROJ, "warehouse", "parquet")
+FACTS = os.path.join(PROJ, "data", "sec", "company_facts")
+os.makedirs(PARQ, exist_ok=True)
+
+def safe_write_parquet(df: pd.DataFrame, path: str, retries: int = 8, base_wait: float = 1.0):
+    """Write to OneDrive path with a temp file + atomic replace and retries (handles sync locks)."""
+    tmp = path + ".tmpwrite"
+    for i in range(retries):
+        try:
+            df.to_parquet(tmp, index=False)
+            os.replace(tmp, path)
+            return True
+        except PermissionError:
+            # OneDrive has the file locked; backoff and try again
+            try:
+                if os.path.exists(tmp): os.remove(tmp)
+            except Exception:
+                pass
+            time.sleep(base_wait * (1.6 ** i))
+    raise PermissionError(f"Could not write {path} after {retries} retries (OneDrive lock?)")
+import os, glob, pandas as pd, time
+try:
+    import orjson as _json; loads = _json.loads
+except Exception:
+    import json as _json; loads = _json.loads
+
+# ---- OneDrive warehouse + facts
+PROJ = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project"
+PARQ = os.path.join(PROJ, "warehouse", "parquet")
+FACTS = os.path.join(PROJ, "data", "sec", "company_facts")
+os.makedirs(PARQ, exist_ok=True)
+
+# --- safe writer from earlier (keep if already defined)
+def safe_write_parquet(df: pd.DataFrame, path: str, retries: int = 8, base_wait: float = 1.0):
+    tmp = path + ".tmpwrite"
+    for i in range(retries):
+        try:
+            df.to_parquet(tmp, index=False)
+            os.replace(tmp, path)
+            return True
+        except PermissionError:
+            try:
+                if os.path.exists(tmp): os.remove(tmp)
+            except Exception: pass
+            time.sleep(base_wait * (1.6 ** i))
+    raise PermissionError(f"Could not write {path} after {retries} retries.")
+
+# ---- load-or-init tables
+def read_or_empty(path, cols, dtypes):
+    if os.path.exists(path): return pd.read_parquet(path)
+    df = pd.DataFrame(columns=cols).astype(dtypes); safe_write_parquet(df, path); return df
+
+path_company = os.path.join(PARQ, "dim_company.parquet")
+path_metric  = os.path.join(PARQ, "dim_metric.parquet")
+path_unit    = os.path.join(PARQ, "dim_unit.parquet")
+path_cal     = os.path.join(PARQ, "dim_calendar.parquet")
+path_filing  = os.path.join(PARQ, "dim_filing.parquet")
+path_fact    = os.path.join(PARQ, "fact_financials.parquet")
+
+dim_company = read_or_empty(path_company,
+    ["company_id","cik","name","ticker","sector","industry","fiscal_year_end_month"],
+    {"company_id":"int64","cik":"string","name":"string","ticker":"string","sector":"string","industry":"string","fiscal_year_end_month":"float64"})
+dim_metric  = read_or_empty(path_metric,
+    ["metric_id","metric_name","xbrl_tag","metric_group","normal_balance"],
+    {"metric_id":"int64","metric_name":"string","xbrl_tag":"string","metric_group":"string","normal_balance":"string"})
+dim_unit    = read_or_empty(path_unit,
+    ["unit_id","unit_code","category","iso_currency","decimals_hint","description"],
+    {"unit_id":"int64","unit_code":"string","category":"string","iso_currency":"string","decimals_hint":"float64","description":"string"})
+dim_calendar= read_or_empty(path_cal,
+    ["calendar_id","date","fiscal_year","fiscal_quarter","fiscal_month","period_type"],
+    {"calendar_id":"int64","date":"string","fiscal_year":"int64","fiscal_quarter":"string","fiscal_month":"int64","period_type":"string"})
+dim_filing  = read_or_empty(path_filing,
+    ["filing_id","form_type","filing_date","accepted_date","period_end_date","accession_number","filing_url"],
+    {"filing_id":"int64","form_type":"string","filing_date":"string","accepted_date":"string","period_end_date":"string","accession_number":"string","filing_url":"string"})
+
+# ---- caches
+co_cache   = {str(r.cik): int(r.company_id) for r in dim_company.itertuples(index=False)}
+met_cache  = {str(r.xbrl_tag): int(r.metric_id) for r in dim_metric.itertuples(index=False)}
+unit_cache = {str(r.unit_code): int(r.unit_id) for r in dim_unit.itertuples(index=False)}
+cal_cache  = {(r.date, r.period_type): int(r.calendar_id) for r in dim_calendar.itertuples(index=False)}
+fil_cache  = {(r.form_type, r.filing_date, r.period_end_date, r.accession_number): int(r.filing_id)
+              for r in dim_filing.itertuples(index=False)}
+
+def get_company_id(cik, name=""):
+    cik = str(cik).zfill(10)
+    if cik in co_cache: return co_cache[cik]
+    next_id = int((dim_company["company_id"].max() if len(dim_company) else 0) + 1)
+    dim_company.loc[len(dim_company)] = {"company_id":next_id,"cik":cik,"name":name or "","ticker":"","sector":"","industry":"","fiscal_year_end_month":pd.NA}
+    co_cache[cik] = next_id; return next_id
+
+def get_metric_id(tag):
+    # set default name/group for "ingest-all"
+    if tag in met_cache: return met_cache[tag]
+    next_id = int((dim_metric["metric_id"].max() if len(dim_metric) else 0) + 1)
+    dim_metric.loc[len(dim_metric)] = {"metric_id":next_id,"metric_name":tag,"xbrl_tag":tag,
+                                       "metric_group":"Auto","normal_balance":""}
+    met_cache[tag] = next_id; return next_id
+
+def get_unit_id(code):
+    if code in unit_cache: return unit_cache[code]
+    next_id = int((dim_unit["unit_id"].max() if len(dim_unit) else 0) + 1)
+    dim_unit.loc[len(dim_unit)] = {"unit_id":next_id,"unit_code":code,"category":"currency",
+                                   "iso_currency":(code if len(code)==3 else "USD"),"decimals_hint":pd.NA,"description":""}
+    unit_cache[code] = next_id; return next_id
+
+def get_calendar_id(period_end, fy, fp, ptype):
+    key = (period_end, ptype)
+    if key in cal_cache: return cal_cache[key]
+    next_id = int((dim_calendar["calendar_id"].max() if len(dim_calendar) else 0) + 1)
+    dim_calendar.loc[len(dim_calendar)] = {"calendar_id":next_id,"date":period_end,"fiscal_year":int(fy),
+                                           "fiscal_quarter":(fp if ptype=="QTR" else "Q4"),
+                                           "fiscal_month":int(period_end[5:7]),"period_type":ptype}
+    cal_cache[key] = next_id; return next_id
+
+def get_filing_id(form_type, filed_date, period_end, accession):
+    key = (form_type or "", filed_date or period_end, period_end, accession or "")
+    if key in fil_cache: return fil_cache[key]
+    next_id = int((dim_filing["filing_id"].max() if len(dim_filing) else 0) + 1)
+    dim_filing.loc[len(dim_filing)] = {"filing_id":next_id,"form_type":key[0],
+                                       "filing_date":key[1],"accepted_date":key[1],
+                                       "period_end_date":key[2],"accession_number":key[3],"filing_url":""}
+    fil_cache[key] = next_id; return next_id
+
+def fp_to_quarter(fp):
+    fp = (fp or "").upper()
+    if fp in ["Q1","Q2","Q3","Q4"]: return fp, "QTR"
+    if fp in ["FY",""]: return "Q4","FY"
+    return "Q4","FY"
+
+# ---- unit filters: keep monetary; skip shares & per-share
+def is_money_unit(u: str) -> bool:
+    u = (u or "").upper()
+    if u in {"USD","USDM","USDTH","USD$"}: return True
+    if len(u) == 3 and u.isalpha(): return True  # e.g., EUR, JPY
+    return False
+
+files = sorted(glob.glob(os.path.join(FACTS, "CIK*.json")))
+print(f"Ingest-all scanning {len(files):,} files from OneDrive …")
+
+rows = []
+PRINT_EVERY = 250
+
+for i, p in enumerate(files, 1):
+    with open(p, "rb") as f:
+        data = loads(f.read())
+
+    cik10 = str(data.get("cik","")).zfill(10)
+    name  = data.get("entityName","")
+    co_id = get_company_id(cik10, name)
+
+    usgaap = (data.get("facts") or {}).get("us-gaap", {})
+    for tag, obj in usgaap.items():
+        units = (obj or {}).get("units", {})
+        if not units: 
+            continue
+
+        # choose a monetary unit if present, else skip
+        unit_key = next((u for u in units.keys() if is_money_unit(u)), None)
+        if not unit_key:
+            continue
+
+        df = pd.DataFrame(units[unit_key])
+        if df.empty:
+            continue
+
+        # keep only rows that look like periodized facts with a number
+        keep = ["fy","fp","end","val","form","filed","accn"]
+        df = df[[c for c in keep if c in df.columns]].dropna(subset=["fy","fp","end","val"])
+        if df.empty:
+            continue
+
+        met_id  = get_metric_id(tag)
+        unit_id = get_unit_id(unit_key)
+
+        for r in df.itertuples(index=False):
+            fp_norm, ptype = fp_to_quarter(getattr(r, "fp", ""))
+            cal_id = get_calendar_id(getattr(r,"end",""), int(getattr(r,"fy",0)), fp_norm, ptype)
+            fil_id = get_filing_id(getattr(r,"form",""), getattr(r,"filed","") or getattr(r,"end",""), getattr(r,"end",""), getattr(r,"accn",""))
+            rows.append((co_id, met_id, cal_id, float(getattr(r,"val",0.0)), unit_id, fil_id, "Consolidated"))
+
+    if i % PRINT_EVERY == 0:
+        print(f"...{i:,}/{len(files):,} files | rows buffered: {len(rows):,}")
+
+# combine with existing and de-duplicate
+incoming = pd.DataFrame(rows, columns=["company_id","metric_id","calendar_id","value","unit_id","filing_id","consolidated_flag"]) if rows else \
+           pd.DataFrame(columns=["company_id","metric_id","calendar_id","value","unit_id","filing_id","consolidated_flag"])
+
+fact_existing = pd.read_parquet(path_fact) if os.path.exists(path_fact) else \
+                pd.DataFrame(columns=["financial_id","company_id","metric_id","calendar_id","value","unit_id","filing_id","consolidated_flag"])
+
+nk = ["company_id","metric_id","calendar_id","filing_id"]
+combined = pd.concat([fact_existing.drop(columns=[], errors="ignore"), incoming], ignore_index=True)
+combined = combined.drop_duplicates(subset=nk, keep="last").reset_index(drop=True)
+combined["financial_id"] = range(1, len(combined)+1)
+
+# write everything safely to OneDrive
+safe_write_parquet(dim_company, path_company)
+safe_write_parquet(dim_metric,  path_metric)
+safe_write_parquet(dim_unit,    path_unit)
+safe_write_parquet(dim_calendar,path_cal)
+safe_write_parquet(dim_filing,  path_filing)
+safe_write_parquet(combined,    path_fact)
+
+print(f"✅ Ingest-all complete. fact_financials rows: {len(combined):,} | unique tags: {dim_metric['xbrl_tag'].nunique():,}")
