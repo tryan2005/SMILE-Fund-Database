@@ -1180,65 +1180,114 @@ if new_rows:
 else:
     print("No new rows found.")
 import os, time, pandas as pd
+# === SMILEFund: Fast SEC ingest (Threaded, vectorized, local SSD, Windows-safe) ===
+import os, glob, time, warnings, pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ---------- FAST JSON LOADER ----------
 try:
     import orjson as _json; loads = _json.loads
 except Exception:
     import json as _json; loads = _json.loads
+print("JSON loader:", loads.__module__)
 
-# ---- ONEDRIVE PATHS
-PROJ = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project"
-PARQ = os.path.join(PROJ, "warehouse", "parquet")
-FACTS = os.path.join(PROJ, "data", "sec", "company_facts")
+# ---------- PATHS ----------
+PROJ  = r"C:\smilefund_project"
+PARQ  = os.path.join(PROJ, "warehouse", "parquet")
+FACTS = r"C:\smilefund_project\data\sec\company_facts"
+TMP_RAW = os.path.join(PARQ, "_raw_deltas")
 os.makedirs(PARQ, exist_ok=True)
+os.makedirs(TMP_RAW, exist_ok=True)
+print("FACTS exists:", os.path.exists(FACTS), "| PARQ exists:", os.path.exists(PARQ))
 
-def safe_write_parquet(df: pd.DataFrame, path: str, retries: int = 8, base_wait: float = 1.0):
-    """Write to OneDrive path with a temp file + atomic replace and retries (handles sync locks)."""
-    tmp = path + ".tmpwrite"
-    for i in range(retries):
-        try:
-            df.to_parquet(tmp, index=False)
-            os.replace(tmp, path)
-            return True
-        except PermissionError:
-            # OneDrive has the file locked; backoff and try again
-            try:
-                if os.path.exists(tmp): os.remove(tmp)
-            except Exception:
-                pass
-            time.sleep(base_wait * (1.6 ** i))
-    raise PermissionError(f"Could not write {path} after {retries} retries (OneDrive lock?)")
-import os, glob, pandas as pd, time
-try:
-    import orjson as _json; loads = _json.loads
-except Exception:
-    import json as _json; loads = _json.loads
+# ---------- HELPERS ----------
+def is_money_unit(u: str) -> bool:
+    u = (u or "").upper()
+    return (u in {"USD","USDM","USDTH","USD$"} or (len(u)==3 and u.isalpha()))
 
-# ---- OneDrive warehouse + facts
-PROJ = r"C:\Users\VTN183\OneDrive - University of Tennessee\smilefund_project"
-PARQ = os.path.join(PROJ, "warehouse", "parquet")
-FACTS = os.path.join(PROJ, "data", "sec", "company_facts")
-os.makedirs(PARQ, exist_ok=True)
+def parse_one(path):
+    with open(path, "rb") as f:
+        data = loads(f.read())
+    out = []
+    cik10 = str(data.get("cik","")).zfill(10)
+    name  = data.get("entityName","")
+    usgaap = (data.get("facts") or {}).get("us-gaap", {})
+    for tag, obj in usgaap.items():
+        units = (obj or {}).get("units", {})
+        if not units:
+            continue
+        unit_key = next((u for u in units.keys() if is_money_unit(u)), None)
+        if not unit_key:
+            continue
+        for r in obj["units"][unit_key]:
+            fy, fp, end, val = r.get("fy"), (r.get("fp") or ""), r.get("end"), r.get("val")
+            if fy is None or not fp or not end or val is None:
+                continue
+            out.append({
+                "cik": cik10,
+                "company_name": name,
+                "xbrl_tag": tag,
+                "unit_code": unit_key,
+                "fy": int(fy),
+                "fp": fp.upper(),
+                "period_end": end,
+                "value": float(val),
+                "form_type": r.get("form",""),
+                "filed_date": r.get("filed", end),
+                "accession": r.get("accn","")
+            })
+    return out
 
-# --- safe writer from earlier (keep if already defined)
-def safe_write_parquet(df: pd.DataFrame, path: str, retries: int = 8, base_wait: float = 1.0):
-    tmp = path + ".tmpwrite"
-    for i in range(retries):
-        try:
-            df.to_parquet(tmp, index=False)
-            os.replace(tmp, path)
-            return True
-        except PermissionError:
-            try:
-                if os.path.exists(tmp): os.remove(tmp)
-            except Exception: pass
-            time.sleep(base_wait * (1.6 ** i))
-    raise PermissionError(f"Could not write {path} after {retries} retries.")
-
-# ---- load-or-init tables
 def read_or_empty(path, cols, dtypes):
-    if os.path.exists(path): return pd.read_parquet(path)
-    df = pd.DataFrame(columns=cols).astype(dtypes); safe_write_parquet(df, path); return df
+    if os.path.exists(path): 
+        return pd.read_parquet(path)
+    df = pd.DataFrame(columns=cols).astype(dtypes)
+    df.to_parquet(path, index=False)
+    return df
 
+# ---------- PHASE A: Threaded scan → raw parquet deltas ----------
+files = sorted(glob.glob(os.path.join(FACTS, "CIK*.json")))
+print(f"Scanning {len(files):,} JSONs with threads …", flush=True)
+
+MAX_WORKERS = min(16, (os.cpu_count() or 12))   # try 12–16
+BATCH       = 2000                               # write every ~2000 files
+PRINT_SECS  = 8
+
+start = time.time()
+last  = start
+delta_paths = []
+rows_total  = 0
+
+for k in range(0, len(files), BATCH):
+    batch = files[k:k+BATCH]
+    recs  = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(parse_one, p): p for p in batch}
+        done = 0
+        for fut in as_completed(futs):
+            recs.extend(fut.result())
+            done += 1
+            now = time.time()
+            if (now - last) >= PRINT_SECS or done == len(batch):
+                overall = k + done
+                rate = overall / max(1e-6, (now - start))
+                eta  = (len(files) - overall) / max(rate, 1e-6)
+                print(f"...{overall:,}/{len(files):,} files | rate: {rate:,.1f}/s | "
+                      f"elapsed: {(now-start)/60:,.1f}m | ETA: {eta/60:,.1f}m", flush=True)
+                last = now
+
+    out_path = os.path.join(TMP_RAW, f"raw_{k+1:06d}_{k+len(batch):06d}.parquet")
+    pd.DataFrame.from_records(recs).to_parquet(out_path, index=False)
+    delta_paths.append(out_path)
+    rows_total += len(recs)
+    print(f"💾 wrote raw delta: {os.path.basename(out_path)} (+{len(recs):,} rows)", flush=True)
+
+print(f"✅ Phase A complete: {len(delta_paths)} raw deltas, {rows_total:,} rows")
+
+# ---------- PHASE B: Vectorized build → dims + fact_financials ----------
 path_company = os.path.join(PARQ, "dim_company.parquet")
 path_metric  = os.path.join(PARQ, "dim_metric.parquet")
 path_unit    = os.path.join(PARQ, "dim_unit.parquet")
@@ -1249,145 +1298,131 @@ path_fact    = os.path.join(PARQ, "fact_financials.parquet")
 dim_company = read_or_empty(path_company,
     ["company_id","cik","name","ticker","sector","industry","fiscal_year_end_month"],
     {"company_id":"int64","cik":"string","name":"string","ticker":"string","sector":"string","industry":"string","fiscal_year_end_month":"float64"})
-dim_metric  = read_or_empty(path_metric,
+dim_metric = read_or_empty(path_metric,
     ["metric_id","metric_name","xbrl_tag","metric_group","normal_balance"],
     {"metric_id":"int64","metric_name":"string","xbrl_tag":"string","metric_group":"string","normal_balance":"string"})
-dim_unit    = read_or_empty(path_unit,
+dim_unit = read_or_empty(path_unit,
     ["unit_id","unit_code","category","iso_currency","decimals_hint","description"],
     {"unit_id":"int64","unit_code":"string","category":"string","iso_currency":"string","decimals_hint":"float64","description":"string"})
-dim_calendar= read_or_empty(path_cal,
+dim_calendar = read_or_empty(path_cal,
     ["calendar_id","date","fiscal_year","fiscal_quarter","fiscal_month","period_type"],
     {"calendar_id":"int64","date":"string","fiscal_year":"int64","fiscal_quarter":"string","fiscal_month":"int64","period_type":"string"})
-dim_filing  = read_or_empty(path_filing,
+dim_filing = read_or_empty(path_filing,
     ["filing_id","form_type","filing_date","accepted_date","period_end_date","accession_number","filing_url"],
-    {"filing_id":"int64","form_type":"string","filing_date":"string","accepted_date":"string","period_end_date":"string","accession_number":"string","filing_url":"string"})
+    {"filing_id":"int64","form_type":"string","filing_date":"string","accepted_date":"string",
+     "period_end_date":"string","accession_number":"string","filing_url":"string"})
 
-# ---- caches
-co_cache   = {str(r.cik): int(r.company_id) for r in dim_company.itertuples(index=False)}
-met_cache  = {str(r.xbrl_tag): int(r.metric_id) for r in dim_metric.itertuples(index=False)}
-unit_cache = {str(r.unit_code): int(r.unit_id) for r in dim_unit.itertuples(index=False)}
-cal_cache  = {(r.date, r.period_type): int(r.calendar_id) for r in dim_calendar.itertuples(index=False)}
-fil_cache  = {(r.form_type, r.filing_date, r.period_end_date, r.accession_number): int(r.filing_id)
-              for r in dim_filing.itertuples(index=False)}
+# Load all raw deltas
+raw_parts = [pd.read_parquet(p) for p in sorted(delta_paths)]
+raw = pd.concat(raw_parts, ignore_index=True) if raw_parts else pd.DataFrame(columns=[
+    "cik","company_name","xbrl_tag","unit_code","fy","fp","period_end","value","form_type","filed_date","accession"
+])
 
-def get_company_id(cik, name=""):
-    cik = str(cik).zfill(10)
-    if cik in co_cache: return co_cache[cik]
-    next_id = int((dim_company["company_id"].max() if len(dim_company) else 0) + 1)
-    dim_company.loc[len(dim_company)] = {"company_id":next_id,"cik":cik,"name":name or "","ticker":"","sector":"","industry":"","fiscal_year_end_month":pd.NA}
-    co_cache[cik] = next_id; return next_id
+# --- Company (bulk)
+new_co = raw[["cik","company_name"]].drop_duplicates().rename(columns={"company_name":"name"})
+dim_company = dim_company.drop_duplicates(subset=["cik"])
+missing_co = new_co[~new_co["cik"].isin(dim_company["cik"])]
+if not missing_co.empty:
+    start_id = int(dim_company["company_id"].max() or 0) + 1
+    missing_co = missing_co.reset_index(drop=True)
+    missing_co.insert(0, "company_id", range(start_id, start_id + len(missing_co)))
+    for col, val in [("ticker",""),("sector",""),("industry",""),("fiscal_year_end_month",pd.NA)]:
+        missing_co[col] = val
+    dim_company = pd.concat([dim_company, missing_co], ignore_index=True)
+dim_company.to_parquet(path_company, index=False)
 
-def get_metric_id(tag):
-    # set default name/group for "ingest-all"
-    if tag in met_cache: return met_cache[tag]
-    next_id = int((dim_metric["metric_id"].max() if len(dim_metric) else 0) + 1)
-    dim_metric.loc[len(dim_metric)] = {"metric_id":next_id,"metric_name":tag,"xbrl_tag":tag,
-                                       "metric_group":"Auto","normal_balance":""}
-    met_cache[tag] = next_id; return next_id
+# --- Metric (bulk)
+missing_met = raw[["xbrl_tag"]].drop_duplicates()
+missing_met = missing_met[~missing_met["xbrl_tag"].isin(dim_metric["xbrl_tag"])]
+if not missing_met.empty:
+    start = int(dim_metric["metric_id"].max() or 0) + 1
+    add = pd.DataFrame({
+        "metric_id": range(start, start+len(missing_met)),
+        "metric_name": missing_met["xbrl_tag"].astype("string"),
+        "xbrl_tag": missing_met["xbrl_tag"].astype("string"),
+        "metric_group": "Auto",
+        "normal_balance": ""
+    })
+    dim_metric = pd.concat([dim_metric, add], ignore_index=True)
+dim_metric.to_parquet(path_metric, index=False)
 
-def get_unit_id(code):
-    if code in unit_cache: return unit_cache[code]
-    next_id = int((dim_unit["unit_id"].max() if len(dim_unit) else 0) + 1)
-    dim_unit.loc[len(dim_unit)] = {"unit_id":next_id,"unit_code":code,"category":"currency",
-                                   "iso_currency":(code if len(code)==3 else "USD"),"decimals_hint":pd.NA,"description":""}
-    unit_cache[code] = next_id; return next_id
+# --- Unit (bulk)
+missing_unit = raw[["unit_code"]].drop_duplicates()
+missing_unit = missing_unit[~missing_unit["unit_code"].isin(dim_unit["unit_code"])]
+if not missing_unit.empty:
+    start = int(dim_unit["unit_id"].max() or 0) + 1
+    add = pd.DataFrame({
+        "unit_id": range(start, start+len(missing_unit)),
+        "unit_code": missing_unit["unit_code"].astype("string"),
+        "category": "currency",
+        "iso_currency": missing_unit["unit_code"].where(missing_unit["unit_code"].str.len()==3, "USD").astype("string"),
+        "decimals_hint": pd.NA,
+        "description": ""
+    })
+    dim_unit = pd.concat([dim_unit, add], ignore_index=True)
+dim_unit.to_parquet(path_unit, index=False)
 
-def get_calendar_id(period_end, fy, fp, ptype):
-    key = (period_end, ptype)
-    if key in cal_cache: return cal_cache[key]
-    next_id = int((dim_calendar["calendar_id"].max() if len(dim_calendar) else 0) + 1)
-    dim_calendar.loc[len(dim_calendar)] = {"calendar_id":next_id,"date":period_end,"fiscal_year":int(fy),
-                                           "fiscal_quarter":(fp if ptype=="QTR" else "Q4"),
-                                           "fiscal_month":int(period_end[5:7]),"period_type":ptype}
-    cal_cache[key] = next_id; return next_id
+# --- Calendar (bulk)
+cal = raw[["period_end","fy","fp"]].drop_duplicates()
+cal["period_type"]   = cal["fp"].where(cal["fp"].isin(["Q1","Q2","Q3","Q4"]), "FY")
+cal["fiscal_quarter"] = cal["fp"].where(cal["period_type"].eq("QTR"), "Q4")
+cal["fiscal_month"]  = cal["period_end"].str[5:7].astype("int64")
+new_cal = cal.rename(columns={"period_end":"date","fy":"fiscal_year"})
+new_cal = new_cal[~new_cal.set_index(["date","period_type"]).index.isin(dim_calendar.set_index(["date","period_type"]).index)]
+if not new_cal.empty:
+    start = int(dim_calendar["calendar_id"].max() or 0) + 1
+    new_cal = new_cal.reset_index(drop=True)
+    new_cal.insert(0, "calendar_id", range(start, start+len(new_cal)))
+    dim_calendar = pd.concat([dim_calendar, new_cal], ignore_index=True)
+dim_calendar.to_parquet(path_cal, index=False)
 
-def get_filing_id(form_type, filed_date, period_end, accession):
-    key = (form_type or "", filed_date or period_end, period_end, accession or "")
-    if key in fil_cache: return fil_cache[key]
-    next_id = int((dim_filing["filing_id"].max() if len(dim_filing) else 0) + 1)
-    dim_filing.loc[len(dim_filing)] = {"filing_id":next_id,"form_type":key[0],
-                                       "filing_date":key[1],"accepted_date":key[1],
-                                       "period_end_date":key[2],"accession_number":key[3],"filing_url":""}
-    fil_cache[key] = next_id; return next_id
+# --- Filing (bulk)
+fil = raw[["form_type","filed_date","period_end","accession"]].drop_duplicates()
+key_old = dim_filing.assign(_k = dim_filing["form_type"].fillna("")+"|"+dim_filing["filing_date"].fillna("")+"|"+dim_filing["period_end_date"].fillna("")+"|"+dim_filing["accession_number"].fillna(""))
+key_new = fil.assign(_k = fil["form_type"].fillna("")+"|"+fil["filed_date"].fillna("")+"|"+fil["period_end"].fillna("")+"|"+fil["accession"].fillna(""))
+to_add = key_new[~key_new["_k"].isin(key_old["_k"])].drop(columns="_k")
+if not to_add.empty:
+    start = int(dim_filing["filing_id"].max() or 0) + 1
+    add = to_add.rename(columns={"filed_date":"filing_date","period_end":"period_end_date","accession":"accession_number"})
+    add = add.reset_index(drop=True)
+    add.insert(0, "filing_id", range(start, start+len(add)))
+    add["accepted_date"] = add["filing_date"]; add["filing_url"] = ""
+    dim_filing = pd.concat([dim_filing, add], ignore_index=True)
+dim_filing.to_parquet(path_filing, index=False)
 
-def fp_to_quarter(fp):
-    fp = (fp or "").upper()
-    if fp in ["Q1","Q2","Q3","Q4"]: return fp, "QTR"
-    if fp in ["FY",""]: return "Q4","FY"
-    return "Q4","FY"
+# --- Map to IDs & write fact_financials
+df = raw.merge(dim_company[["company_id","cik"]], on="cik", how="left") \
+        .merge(dim_metric[["metric_id","xbrl_tag"]], on="xbrl_tag", how="left") \
+        .merge(dim_unit[["unit_id","unit_code"]], on="unit_code", how="left")
 
-# ---- unit filters: keep monetary; skip shares & per-share
-def is_money_unit(u: str) -> bool:
-    u = (u or "").upper()
-    if u in {"USD","USDM","USDTH","USD$"}: return True
-    if len(u) == 3 and u.isalpha(): return True  # e.g., EUR, JPY
-    return False
+cal_key = dim_calendar[["calendar_id","date","period_type"]]
+tmp = raw[["period_end","fp"]].copy()
+tmp["period_type"] = tmp["fp"].where(tmp["fp"].isin(["Q1","Q2","Q3","Q4"]), "FY")
+df = df.merge(tmp[["period_end","period_type"]].drop_duplicates(),
+              on=["period_end","period_type"], how="left") \
+       .merge(cal_key, left_on=["period_end","period_type"], right_on=["date","period_type"], how="left") \
+       .drop(columns=["date"])
 
-files = sorted(glob.glob(os.path.join(FACTS, "CIK*.json")))
-print(f"Ingest-all scanning {len(files):,} files from OneDrive …")
+fil_map = dim_filing[["filing_id","form_type","filing_date","period_end_date","accession_number"]]
+df = df.merge(fil_map, left_on=["form_type","filed_date","period_end","accession"],
+              right_on=["form_type","filing_date","period_end_date","accession_number"], how="left") \
+       .drop(columns=["filing_date","period_end_date","accession_number"])
 
-rows = []
-PRINT_EVERY = 250
+fact_cols = ["company_id","metric_id","calendar_id","value","unit_id","filing_id"]
+incoming = df[fact_cols].copy()
+incoming["consolidated_flag"] = "Consolidated"
 
-for i, p in enumerate(files, 1):
-    with open(p, "rb") as f:
-        data = loads(f.read())
-
-    cik10 = str(data.get("cik","")).zfill(10)
-    name  = data.get("entityName","")
-    co_id = get_company_id(cik10, name)
-
-    usgaap = (data.get("facts") or {}).get("us-gaap", {})
-    for tag, obj in usgaap.items():
-        units = (obj or {}).get("units", {})
-        if not units: 
-            continue
-
-        # choose a monetary unit if present, else skip
-        unit_key = next((u for u in units.keys() if is_money_unit(u)), None)
-        if not unit_key:
-            continue
-
-        df = pd.DataFrame(units[unit_key])
-        if df.empty:
-            continue
-
-        # keep only rows that look like periodized facts with a number
-        keep = ["fy","fp","end","val","form","filed","accn"]
-        df = df[[c for c in keep if c in df.columns]].dropna(subset=["fy","fp","end","val"])
-        if df.empty:
-            continue
-
-        met_id  = get_metric_id(tag)
-        unit_id = get_unit_id(unit_key)
-
-        for r in df.itertuples(index=False):
-            fp_norm, ptype = fp_to_quarter(getattr(r, "fp", ""))
-            cal_id = get_calendar_id(getattr(r,"end",""), int(getattr(r,"fy",0)), fp_norm, ptype)
-            fil_id = get_filing_id(getattr(r,"form",""), getattr(r,"filed","") or getattr(r,"end",""), getattr(r,"end",""), getattr(r,"accn",""))
-            rows.append((co_id, met_id, cal_id, float(getattr(r,"val",0.0)), unit_id, fil_id, "Consolidated"))
-
-    if i % PRINT_EVERY == 0:
-        print(f"...{i:,}/{len(files):,} files | rows buffered: {len(rows):,}")
-
-# combine with existing and de-duplicate
-incoming = pd.DataFrame(rows, columns=["company_id","metric_id","calendar_id","value","unit_id","filing_id","consolidated_flag"]) if rows else \
-           pd.DataFrame(columns=["company_id","metric_id","calendar_id","value","unit_id","filing_id","consolidated_flag"])
-
-fact_existing = pd.read_parquet(path_fact) if os.path.exists(path_fact) else \
-                pd.DataFrame(columns=["financial_id","company_id","metric_id","calendar_id","value","unit_id","filing_id","consolidated_flag"])
+path_fact = os.path.join(PARQ, "fact_financials.parquet")
+if os.path.exists(path_fact):
+    fact_existing = pd.read_parquet(path_fact)
+else:
+    fact_existing = pd.DataFrame(columns=["financial_id"] + fact_cols + ["consolidated_flag"])
 
 nk = ["company_id","metric_id","calendar_id","filing_id"]
 combined = pd.concat([fact_existing.drop(columns=[], errors="ignore"), incoming], ignore_index=True)
 combined = combined.drop_duplicates(subset=nk, keep="last").reset_index(drop=True)
 combined["financial_id"] = range(1, len(combined)+1)
+combined.to_parquet(path_fact, index=False)
 
-# write everything safely to OneDrive
-safe_write_parquet(dim_company, path_company)
-safe_write_parquet(dim_metric,  path_metric)
-safe_write_parquet(dim_unit,    path_unit)
-safe_write_parquet(dim_calendar,path_cal)
-safe_write_parquet(dim_filing,  path_filing)
-safe_write_parquet(combined,    path_fact)
+print(f"✅ Done. fact_financials rows: {len(combined):,} | unique tags: {dim_metric['xbrl_tag'].nunique():,} | elapsed: {(time.time()-start)/60:,.1f} min")
 
-print(f"✅ Ingest-all complete. fact_financials rows: {len(combined):,} | unique tags: {dim_metric['xbrl_tag'].nunique():,}")
