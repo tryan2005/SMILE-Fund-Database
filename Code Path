@@ -2634,3 +2634,1150 @@ con.close()
 
 print("✅ Snapshots rebuilt (bad tags filtered).")
 print("Apple tags present in latest_annual now:\n", apple.head(10))
+from pathlib import Path
+import os, re, time, shutil
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+
+PROJECT_ROOT = Path(r"C:\smilefund_project")
+RAW_DIR      = PROJECT_ROOT / r"warehouse\parquet\_raw_deltas"
+OUT_V4       = PROJECT_ROOT / r"warehouse\parquet\facts_by_group_v4"
+OUT_V4_SAMPLE= PROJECT_ROOT / r"warehouse\parquet\facts_by_group_v4_sample"
+
+print("RAW_DIR:", RAW_DIR)
+if not RAW_DIR.exists():
+    raise FileNotFoundError(f"RAW dir does not exist: {RAW_DIR}")
+
+# 1) Dataset + file count
+dataset = ds.dataset(str(RAW_DIR), format="parquet")
+print("RAW columns:", dataset.schema.names)
+print("Number of RAW files:", len(dataset.files))
+
+# 2) Grab the first batch for a quick preview
+BATCH_SIZE = 100_000
+batches = dataset.to_batches(batch_size=BATCH_SIZE)
+first_batch = None
+try:
+    first_batch = next(batches)
+except StopIteration:
+    first_batch = None
+
+if first_batch is None:
+    raise RuntimeError("RAW dataset appears to be empty—no batches yielded.")
+
+tbl0 = pa.Table.from_batches([first_batch])
+print(f"First batch rows: {tbl0.num_rows:,}")
+print("Preview columns present:", tbl0.column_names)
+show_cols = [c for c in ["cik","xbrl_tag","value","unit_code","fy","fp","period_end","filed_date"] if c in tbl0.column_names]
+print("Preview (first 5 rows):")
+print(tbl0.select(show_cols).slice(0,5).to_pandas())
+
+# ---- grouping helpers ----
+TAG_GROUPS = {
+    "Revenue": {"Revenues","SalesRevenueNet",
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "SalesRevenueGoodsAndServicesNet","SalesRevenueGoodsNet","SalesRevenueServicesNet",
+                "TotalRevenueAndOtherIncome"},
+    "Expenses": {"CostOfGoodsAndServicesSold","CostOfRevenue",
+                 "SellingGeneralAndAdministrativeExpense","ResearchAndDevelopmentExpense",
+                 "OperatingExpenses","InterestExpense","RestructuringCharges"},
+    "Assets": {"Assets","AssetsCurrent","CashAndCashEquivalentsAtCarryingValue",
+               "AccountsReceivableNetCurrent","InventoryNet","Goodwill",
+               "IntangibleAssetsNetExcludingGoodwill","PropertyPlantAndEquipmentNet"},
+    "Liabilities": {"Liabilities","LiabilitiesCurrent","AccountsPayableCurrent",
+                    "LongTermDebtNoncurrent","DeferredRevenueCurrent","DeferredTaxLiabilitiesNoncurrent"},
+    "Equity": {"StockholdersEquity","RetainedEarningsAccumulatedDeficit","CommonStockValue",
+               "AdditionalPaidInCapital","TreasuryStockValue"},
+    "CashFlow": {"NetCashProvidedByUsedInOperatingActivities","NetCashProvidedByUsedInInvestingActivities",
+                 "NetCashProvidedByUsedInFinancingActivities","PaymentsForRepurchaseOfCommonStock","PaymentsOfDividends"},
+    "OCI": {"OtherComprehensiveIncomeLossNetOfTax"},
+    "PerShare": {"EarningsPerShareBasic","EarningsPerShareDiluted","CommonStockDividendsPerShareDeclared"},
+    "KPIs": {"CustomersNumber","EmployeesNumber","ActiveUsers","RevenuePerShare"},
+}
+BASE = {t.lower(): g for g, tags in TAG_GROUPS.items() for t in tags}
+PATTERN_RULES = [
+    ("Revenue",   r"(revenue|sales)(?!per)"),
+    ("Expenses",  r"(expense|costof|costs?|cogs)"),
+    ("Assets",    r"(^assets?$|asset)"),
+    ("Liabilities", r"(liabilit)"),
+    ("Equity",    r"(equity|retainedearnings|paidincapital|treasurystock)"),
+    ("CashFlow",  r"(netcash|operatingactivit|investingactivit|financingactivit|dividend|repurchase)"),
+    ("OCI",       r"(othercomprehensiveincome)"),
+    ("PerShare",  r"(earningspershare|dividendsPerShare|perShare)"),
+    ("Revenue",   r"(totalrevenueandotherincome)"),
+]
+compiled = [(g, re.compile(p, re.IGNORECASE)) for g,p in PATTERN_RULES]
+
+def infer_group(tag_str: str) -> str:
+    if not tag_str:
+        return "Other"
+    base = tag_str.split(":", 1)[-1]
+    low = base.lower()
+    if low in BASE:
+        return BASE[low]
+    for g, rx in compiled:
+        if rx.search(low):
+            return g
+    return "Other"
+
+def ensure_col(tbl: pa.Table, name: str, typ: pa.DataType) -> pa.Table:
+    if name not in tbl.column_names:
+        tbl = tbl.append_column(name, pa.array([None]*tbl.num_rows, type=typ))
+    return tbl
+
+def cast_if_possible(tbl: pa.Table, name: str, typ: pa.DataType) -> pa.Table:
+    if name in tbl.column_names:
+        try:
+            tbl = tbl.set_column(tbl.schema.get_field_index(name), name, pc.cast(tbl[name], typ))
+        except Exception:
+            pass
+    return tbl
+
+def normalize_and_partition(tbl: pa.Table) -> pa.Table:
+    # Ensure expected RAW columns present & cast
+    for name, typ in [
+        ("cik", pa.int64()),
+        ("xbrl_tag", pa.utf8()),
+        ("value", pa.float64()),
+        ("unit_code", pa.utf8()),
+        ("fy", pa.int32()),
+        ("fp", pa.utf8()),
+        ("period_end", pa.utf8()),
+        ("filed_date", pa.utf8()),
+        ("form_type", pa.utf8()),
+        ("accession", pa.utf8()),
+    ]:
+        tbl = ensure_col(tbl, name, typ)
+        tbl = cast_if_possible(tbl, name, typ)
+
+    # Canonical rename
+    ren_map = {
+        "xbrl_tag": "tag",
+        "value": "val",
+        "unit_code": "unit",
+        "period_end": "end",
+        "filed_date": "filed",
+        "form_type": "form",
+        "accession": "accn",
+    }
+    for src, dst in ren_map.items():
+        if src in tbl.column_names:
+            col = tbl[src]
+            if dst in tbl.column_names:
+                tbl = tbl.set_column(tbl.schema.get_field_index(dst), dst, col)
+            else:
+                tbl = tbl.append_column(dst, col)
+
+    # Clean tag
+    tag_utf8 = pc.cast(tbl["tag"], pa.utf8())
+    tbl = tbl.set_column(tbl.schema.get_field_index("tag"), "tag", tag_utf8)
+    mask = pc.and_(pc.invert(pc.is_null(tag_utf8)), pc.greater(pc.utf8_length(tag_utf8), 0))
+    tbl = tbl.filter(mask)
+
+    # Derive group
+    groups = pa.array([infer_group(t or "") for t in tag_utf8.to_pylist()], type=pa.utf8())
+    tbl = tbl.append_column("group", groups)
+
+    # Consistent order
+    keep = [c for c in ["cik","tag","unit","fy","fp","end","filed","form","accn","val","group"] if c in tbl.column_names]
+    return tbl.select(keep)
+
+# 3) Tiny dry-run to SAMPLE output (first batch only)
+print("\n--- Dry-run: writing 1 batch to facts_by_group_v4_sample ---")
+shutil.rmtree(OUT_V4_SAMPLE, ignore_errors=True)
+OUT_V4_SAMPLE.mkdir(parents=True, exist_ok=True)
+
+tbl_sample = normalize_and_partition(tbl0)
+# write one batch
+pq.write_to_dataset(
+    table=tbl_sample,
+    root_path=str(OUT_V4_SAMPLE),
+    partition_cols=["group","tag"],
+    compression="snappy",
+    existing_data_behavior="overwrite_or_ignore",
+)
+print("Sample write complete at:", OUT_V4_SAMPLE)
+# quick peek at partitions created
+created = []
+for root, dirs, files in os.walk(OUT_V4_SAMPLE):
+    for f in files:
+        if f.endswith(".parquet"):
+            created.append(os.path.join(root, f))
+            if len(created) >= 3:
+                break
+    if len(created) >= 3:
+        break
+print("Sample files (up to 3):", created[:3])
+
+# 4) Full run with VERBOSE progress
+print("\n--- Full fan-out to facts_by_group_v4 (verbose) ---")
+shutil.rmtree(OUT_V4, ignore_errors=True)
+OUT_V4.mkdir(parents=True, exist_ok=True)
+
+t0 = time.time()
+rows_total = 0
+batch_idx = 0
+
+for batch in ds.dataset(str(RAW_DIR), format="parquet").to_batches(batch_size=BATCH_SIZE):
+    batch_idx += 1
+    tbl = pa.Table.from_batches([batch])
+    tbl = normalize_and_partition(tbl)
+    rows_total += tbl.num_rows
+
+    pq.write_to_dataset(
+        table=tbl,
+        root_path=str(OUT_V4),
+        partition_cols=["group","tag"],
+        compression="snappy",
+        existing_data_behavior="overwrite_or_ignore",
+    )
+
+    print(f"[v4] wrote batch {batch_idx:,}  rows={tbl.num_rows:,}  total={rows_total:,}")
+
+elapsed = time.time() - t0
+print(f"\n✅ DONE: facts_by_group_v4 at {OUT_V4}")
+print(f"   Batches: {batch_idx:,}   Rows written: {rows_total:,}   Time: {elapsed:.1f}s")
+# Preview valid Parquet rows from facts_by_group_v4_sample
+import os, glob
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+
+SAMPLE_DIR = r"C:\smilefund_project\warehouse\parquet\facts_by_group_v4_sample"
+
+def is_real_parquet(path: str) -> bool:
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < 16:
+            return False
+        with open(path, "rb") as f:
+            f.seek(-4, os.SEEK_END)
+            return f.read(4) == b"PAR1"
+    except Exception:
+        return False
+
+print("Sample dir exists:", os.path.exists(SAMPLE_DIR))
+candidates = glob.glob(os.path.join(SAMPLE_DIR, "**", "*.parquet"), recursive=True)
+valid_files = [p for p in candidates if is_real_parquet(p)]
+print("Valid parquet files:", len(valid_files))
+print("First 3 valid files:", valid_files[:3])
+
+if not valid_files:
+    raise SystemExit("No valid parquet files detected in sample.")
+
+sample_ds = ds.dataset(valid_files, format="parquet")
+print("Columns:", sample_ds.schema.names)
+
+batches = sample_ds.to_batches(batch_size=5)
+first_batch = next(batches)
+tbl = pa.Table.from_batches([first_batch])  # <-- correct conversion
+print("First 5 rows:\n", tbl.to_pandas())
+# Delete invalid/corrupted parquet files in facts_by_group_v4 (skip if already gone)
+import os
+from pathlib import Path
+import pyarrow.parquet as pq
+
+V4_DIR = Path(r"C:\smilefund_project\warehouse\parquet\facts_by_group_v4")
+deleted, kept, missing = 0, 0, 0
+
+def is_valid_parquet(p: Path) -> bool:
+    try:
+        if not p.is_file(): 
+            return False
+        if p.stat().st_size < 16:
+            return False
+        with p.open("rb") as f:
+            f.seek(-4, os.SEEK_END)
+            if f.read(4) != b"PAR1":
+                return False
+        # deep check
+        _ = pq.ParquetFile(str(p))
+        return True
+    except Exception:
+        return False
+
+for root, _, files in os.walk(V4_DIR):
+    for fn in files:
+        if not fn.lower().endswith(".parquet"):
+            continue
+        p = Path(root) / fn
+        try:
+            if is_valid_parquet(p):
+                kept += 1
+            else:
+                try:
+                    os.remove(str(p))
+                    deleted += 1
+                except FileNotFoundError:
+                    missing += 1  # already gone — fine
+        except FileNotFoundError:
+            missing += 1
+
+print(f"✅ Clean complete. Kept: {kept:,}  Deleted: {deleted:,}  Missing (already gone): {missing:,}")
+
+# Optional: prune empty directories
+empties = 0
+for root, dirs, files in os.walk(V4_DIR, topdown=False):
+    if not dirs and not files:
+        try:
+            Path(root).rmdir()
+            empties += 1
+        except OSError:
+            pass
+print(f"Pruned empty dirs: {empties}")
+import os, duckdb
+
+V4   = r"C:\smilefund_project\warehouse\parquet\facts_by_group_v4\**\*.parquet"
+SNAP = r"C:\smilefund_project\warehouse\parquet\snapshots"
+os.makedirs(SNAP, exist_ok=True)
+
+con = duckdb.connect()
+
+# Normalize tag & pull hive partitions
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW facts_min AS
+  SELECT
+    CASE WHEN position(':' IN tag) > 0 THEN split_part(tag,':',2) ELSE tag END AS tag,
+    "group", cik, fy, fp, val
+  FROM parquet_scan('{V4}', HIVE_PARTITIONING=1)
+  WHERE val IS NOT NULL
+    AND tag IS NOT NULL AND tag <> '' AND tag <> '__HIVE_DEFAULT_PARTITION__'
+""")
+
+# Rank (FY > Q4 > Q3 > Q2 > Q1)
+con.execute("""
+  CREATE OR REPLACE TEMP VIEW facts_ranked AS
+  SELECT *,
+    CASE fp WHEN 'FY' THEN 5 WHEN 'Q4' THEN 4 WHEN 'Q3' THEN 3 WHEN 'Q2' THEN 2 WHEN 'Q1' THEN 1 ELSE 0 END AS fp_rank
+  FROM facts_min
+""")
+
+con.execute("""
+  CREATE OR REPLACE TABLE latest_any AS
+  SELECT * FROM (
+    SELECT cik, tag, fy, fp, val,
+           ROW_NUMBER() OVER (PARTITION BY cik, tag ORDER BY fy DESC, fp_rank DESC) rn
+    FROM facts_ranked
+  ) WHERE rn=1
+""")
+con.execute(f"COPY latest_any TO '{SNAP}\\latest_any.parquet' (FORMAT PARQUET);")
+
+con.execute("""
+  CREATE OR REPLACE TABLE latest_annual AS
+  SELECT * FROM (
+    SELECT cik, tag, fy, fp, val,
+           ROW_NUMBER() OVER (PARTITION BY cik, tag, fy ORDER BY fp_rank DESC) rn
+    FROM facts_ranked
+    WHERE fp='FY'
+  ) WHERE rn=1
+""")
+con.execute(f"COPY latest_annual TO '{SNAP}\\latest_annual.parquet' (FORMAT PARQUET);")
+
+con.execute("""
+  CREATE OR REPLACE TABLE latest_quarterly AS
+  SELECT * FROM (
+    SELECT cik, tag, fy, fp, val,
+           ROW_NUMBER() OVER (PARTITION BY cik, tag, fy, fp ORDER BY fp_rank DESC) rn
+    FROM facts_ranked
+    WHERE fp IN ('Q1','Q2','Q3','Q4')
+  ) WHERE rn=1
+""")
+con.execute(f"COPY latest_quarterly TO '{SNAP}\\latest_quarterly.parquet' (FORMAT PARQUET);")
+
+print("Apple rows in latest_annual:",
+      con.execute(f"SELECT COUNT(*) FROM read_parquet('{SNAP}\\latest_annual.parquet') WHERE cik=320193").fetchone()[0])
+print(con.execute(f"""
+  SELECT tag, COUNT(*) n
+  FROM read_parquet('{SNAP}\\latest_annual.parquet')
+  WHERE cik=320193
+  GROUP BY tag ORDER BY n DESC LIMIT 10
+""").fetch_df())
+
+con.close()
+print("✅ snapshots rebuilt from cleaned v4")
+# Diagnose: is Apple (CIK 320193) in RAW? If not, show which CIKs/tags ARE present.
+import duckdb, os, pandas as pd
+
+RAW   = r"C:\smilefund_project\warehouse\parquet\_raw_deltas\**\*.parquet"
+V4    = r"C:\smilefund_project\warehouse\parquet\facts_by_group_v4\**\*.parquet"
+SNAPA = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_annual.parquet"
+SNAPQ = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_quarterly.parquet"
+
+con = duckdb.connect()
+
+print("== Check Apple in RAW ==")
+apple_raw_count = con.execute(f"""
+  SELECT COUNT(*) 
+  FROM parquet_scan('{RAW}')
+  WHERE TRY_CAST(cik AS BIGINT) = 320193
+""").fetchone()[0]
+print("RAW rows for CIK 320193:", apple_raw_count)
+
+if apple_raw_count > 0:
+    print("\nSample Apple rows (RAW):")
+    print(con.execute(f"""
+      SELECT cik, xbrl_tag, fy, fp, value
+      FROM parquet_scan('{RAW}')
+      WHERE TRY_CAST(cik AS BIGINT)=320193
+      ORDER BY fy NULLS LAST, fp NULLS LAST
+      LIMIT 10
+    """).fetch_df())
+else:
+    print("\nApple not found in RAW. Listing a few CIKs that DO exist in RAW:")
+    print(con.execute(f"""
+      SELECT TRY_CAST(cik AS BIGINT) AS cik, COUNT(*) n
+      FROM parquet_scan('{RAW}')
+      GROUP BY 1
+      ORDER BY n DESC
+      LIMIT 10
+    """).fetch_df())
+
+print("\n== Quick look at v4 contents (post-fanout) ==")
+print(con.execute(f"""
+  SELECT COUNT(*) AS rows_v4 FROM parquet_scan('{V4}', HIVE_PARTITIONING=1)
+""").fetch_df())
+
+print("\nTop tags present in v4 (sample):")
+print(con.execute(f"""
+  SELECT tag, COUNT(*) n
+  FROM parquet_scan('{V4}', HIVE_PARTITIONING=1)
+  WHERE tag IS NOT NULL AND tag <> '' AND tag <> '__HIVE_DEFAULT_PARTITION__'
+  GROUP BY tag
+  ORDER BY n DESC
+  LIMIT 20
+""").fetch_df())
+
+print("\nTop CIKs present in latest_annual snapshot:")
+print(con.execute(f"""
+  SELECT cik, COUNT(*) n
+  FROM read_parquet('{SNAPA}')
+  GROUP BY cik
+  ORDER BY n DESC
+  LIMIT 10
+""").fetch_df())
+
+con.close()
+# Clean re-fan-out: RAW -> facts_by_group_v4 (progress prints), then verify Apple in v4
+from pathlib import Path
+import os, re, time, shutil, uuid
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+import duckdb
+
+PROJECT_ROOT = Path(r"C:\smilefund_project")
+RAW_DIR      = PROJECT_ROOT / r"warehouse\parquet\_raw_deltas"
+OUT_V4       = PROJECT_ROOT / r"warehouse\parquet\facts_by_group_v4"
+
+# 0) Fresh start
+shutil.rmtree(OUT_V4, ignore_errors=True)
+OUT_V4.mkdir(parents=True, exist_ok=True)
+
+# 1) Helpers
+TAG_GROUPS = {
+    "Revenue": {"Revenues","SalesRevenueNet","RevenueFromContractWithCustomerExcludingAssessedTax",
+                "SalesRevenueGoodsAndServicesNet","SalesRevenueGoodsNet","SalesRevenueServicesNet",
+                "TotalRevenueAndOtherIncome"},
+    "Expenses": {"CostOfGoodsAndServicesSold","CostOfRevenue",
+                 "SellingGeneralAndAdministrativeExpense","ResearchAndDevelopmentExpense",
+                 "OperatingExpenses","InterestExpense","RestructuringCharges"},
+    "Assets": {"Assets","AssetsCurrent","CashAndCashEquivalentsAtCarryingValue",
+               "AccountsReceivableNetCurrent","InventoryNet","Goodwill",
+               "IntangibleAssetsNetExcludingGoodwill","PropertyPlantAndEquipmentNet"},
+    "Liabilities": {"Liabilities","LiabilitiesCurrent","AccountsPayableCurrent",
+                    "LongTermDebtNoncurrent","DeferredRevenueCurrent","DeferredTaxLiabilitiesNoncurrent"},
+    "Equity": {"StockholdersEquity","RetainedEarningsAccumulatedDeficit","CommonStockValue",
+               "AdditionalPaidInCapital","TreasuryStockValue"},
+    "CashFlow": {"NetCashProvidedByUsedInOperatingActivities","NetCashProvidedByUsedInInvestingActivities",
+                 "NetCashProvidedByUsedInFinancingActivities","PaymentsForRepurchaseOfCommonStock","PaymentsOfDividends"},
+    "OCI": {"OtherComprehensiveIncomeLossNetOfTax"},
+    "PerShare": {"EarningsPerShareBasic","EarningsPerShareDiluted","CommonStockDividendsPerShareDeclared"},
+    "KPIs": {"CustomersNumber","EmployeesNumber","ActiveUsers","RevenuePerShare"},
+}
+BASE = {t.lower(): g for g, tags in TAG_GROUPS.items() for t in tags}
+compiled = [
+    ("Revenue", re.compile(r"(revenue|sales)(?!per)", re.I)),
+    ("Expenses", re.compile(r"(expense|costof|costs?|cogs)", re.I)),
+    ("Assets", re.compile(r"(^assets?$|asset)", re.I)),
+    ("Liabilities", re.compile(r"(liabilit)", re.I)),
+    ("Equity", re.compile(r"(equity|retainedearnings|paidincapital|treasurystock)", re.I)),
+    ("CashFlow", re.compile(r"(netcash|operatingactivit|investingactivit|financingactivit|dividend|repurchase)", re.I)),
+    ("OCI", re.compile(r"(othercomprehensiveincome)", re.I)),
+    ("PerShare", re.compile(r"(earningspershare|dividendsPerShare|perShare)", re.I)),
+    ("Revenue", re.compile(r"(totalrevenueandotherincome)", re.I)),
+]
+def infer_group(tag: str) -> str:
+    if not tag: return "Other"
+    base = tag.split(":", 1)[-1].lower()
+    if base in BASE: return BASE[base]
+    for g, rx in compiled:
+        if rx.search(base): return g
+    return "Other"
+
+def ensure(tbl: pa.Table, name: str, typ: pa.DataType) -> pa.Table:
+    if name not in tbl.column_names:
+        tbl = tbl.append_column(name, pa.array([None]*tbl.num_rows, type=typ))
+    return tbl
+
+def cast(tbl: pa.Table, name: str, typ: pa.DataType) -> pa.Table:
+    if name in tbl.column_names:
+        try:
+            tbl = tbl.set_column(tbl.schema.get_field_index(name), name, pc.cast(tbl[name], typ))
+        except Exception:
+            pass
+    return tbl
+
+# 2) Stream RAW -> write v4 with progress
+ds_raw = ds.dataset(str(RAW_DIR), format="parquet")
+BATCH = 250_000
+total_rows = 0
+t0 = time.time()
+
+for i, batch in enumerate(ds_raw.to_batches(batch_size=BATCH), start=1):
+    tbl = pa.Table.from_batches([batch])
+
+    # normalize columns
+    for nm, tp in [("cik", pa.int64()), ("xbrl_tag", pa.utf8()), ("value", pa.float64()),
+                   ("unit_code", pa.utf8()), ("fy", pa.int32()), ("fp", pa.utf8()),
+                   ("period_end", pa.utf8()), ("filed_date", pa.utf8()),
+                   ("form_type", pa.utf8()), ("accession", pa.utf8())]:
+        tbl = ensure(tbl, nm, tp); tbl = cast(tbl, nm, tp)
+
+    # rename to canonical
+    ren = {"xbrl_tag":"tag","value":"val","unit_code":"unit","period_end":"end",
+           "filed_date":"filed","form_type":"form","accession":"accn"}
+    for s,d in ren.items():
+        if s in tbl.column_names:
+            col = tbl[s]
+            if d in tbl.column_names:
+                tbl = tbl.set_column(tbl.schema.get_field_index(d), d, col)
+            else:
+                tbl = tbl.append_column(d, col)
+
+    # drop null/empty tags
+    tag = pc.cast(tbl["tag"], pa.utf8())
+    tbl = tbl.set_column(tbl.schema.get_field_index("tag"), "tag", tag)
+    mask = pc.and_(pc.invert(pc.is_null(tag)), pc.greater(pc.utf8_length(tag), 0))
+    tbl = tbl.filter(mask)
+
+    # derive group
+    groups = pa.array([infer_group(t or "") for t in tag.to_pylist()], type=pa.utf8())
+    tbl = tbl.append_column("group", groups)
+
+    # order columns
+    keep = [c for c in ["cik","tag","unit","fy","fp","end","filed","form","accn","val","group"] if c in tbl.column_names]
+    tbl = tbl.select(keep)
+
+    # write hive partitions
+    pq.write_to_dataset(
+        table=tbl,
+        root_path=str(OUT_V4),
+        partition_cols=["group","tag"],
+        compression="snappy",
+        existing_data_behavior="overwrite_or_ignore",
+        basename_template=f"{uuid.uuid4().hex}-{{i}}.parquet"  # reduce chance of name collisions
+    )
+
+    total_rows += tbl.num_rows
+    print(f"[v4] batch {i} rows={tbl.num_rows:,} total={total_rows:,}", flush=True)
+
+elapsed = time.time() - t0
+print(f"✅ v4 complete at {OUT_V4} • rows written: {total_rows:,} • {elapsed:.1f}s", flush=True)
+
+# 3) Immediate Apple presence check in v4
+con = duckdb.connect()
+count_apple_v4 = con.execute(f"""
+  SELECT COUNT(*) FROM parquet_scan('{str(OUT_V4)}\\**\\*.parquet', HIVE_PARTITIONING=1)
+  WHERE TRY_CAST(cik AS BIGINT)=320193
+""").fetchone()[0]
+print("Apple rows present in v4:", count_apple_v4)
+# show a couple tags seen for Apple in v4
+if count_apple_v4:
+    print(con.execute(f"""
+      SELECT tag, COUNT(*) n
+      FROM parquet_scan('{str(OUT_V4)}\\**\\*.parquet', HIVE_PARTITIONING=1)
+      WHERE TRY_CAST(cik AS BIGINT)=320193 AND tag IS NOT NULL AND tag <> ''
+      GROUP BY tag ORDER BY n DESC LIMIT 10
+    """).fetch_df())
+con.close()
+# Build a per-CIK Revenue tag choice (alias) from RAW
+import os, duckdb
+
+RAW = r"C:\smilefund_project\warehouse\parquet\_raw_deltas\**\*.parquet"
+OUT = r"C:\smilefund_project\warehouse\parquet\dimensions\dim_revenue_tag_choice.parquet"
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+
+con = duckdb.connect()
+
+# Normalize RAW once
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW raw_norm AS
+  SELECT
+    TRY_CAST(cik AS BIGINT) AS cik,
+    CASE WHEN position(':' IN xbrl_tag) > 0 THEN split_part(xbrl_tag,':',2) ELSE xbrl_tag END AS tag,
+    TRY_CAST(fy AS INTEGER) AS fy,
+    CAST(fp AS VARCHAR)     AS fp,
+    TRY_CAST(value AS DOUBLE) AS val
+  FROM parquet_scan('{RAW}')
+  WHERE value IS NOT NULL AND xbrl_tag IS NOT NULL AND xbrl_tag <> ''
+""")
+
+# Candidate revenue tags (ordered by preference)
+CANDS = (
+    'Revenues',
+    'SalesRevenueNet',
+    'RevenueFromContractWithCustomerExcludingAssessedTax',
+    'SalesRevenueGoodsAndServicesNet',
+    'SalesRevenueGoodsNet',
+    'SalesRevenueServicesNet',
+    'TotalRevenueAndOtherIncome'
+)
+cand_sql = ",".join([f"'{t}'" for t in CANDS])
+
+# Count which candidates each CIK actually reports, prefer by our priority then by volume
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW revenue_candidates AS
+  SELECT
+    cik, tag, COUNT(*) AS n,
+    CASE tag
+      WHEN 'Revenues' THEN 1
+      WHEN 'SalesRevenueNet' THEN 2
+      WHEN 'RevenueFromContractWithCustomerExcludingAssessedTax' THEN 3
+      WHEN 'SalesRevenueGoodsAndServicesNet' THEN 4
+      WHEN 'SalesRevenueGoodsNet' THEN 5
+      WHEN 'SalesRevenueServicesNet' THEN 6
+      WHEN 'TotalRevenueAndOtherIncome' THEN 7
+      ELSE 99
+    END AS pref
+  FROM raw_norm
+  WHERE tag IN ({cand_sql})
+  GROUP BY cik, tag
+""")
+
+# One chosen tag per CIK
+con.execute("""
+  CREATE OR REPLACE TABLE dim_revenue_tag_choice AS
+  SELECT cik, tag AS chosen_revenue_tag
+  FROM (
+    SELECT
+      cik, tag, n, pref,
+      ROW_NUMBER() OVER (PARTITION BY cik ORDER BY pref ASC, n DESC) AS rn
+    FROM revenue_candidates
+  )
+  WHERE rn = 1
+""")
+
+# Persist to Parquet
+con.execute(f"COPY dim_revenue_tag_choice TO '{OUT}' (FORMAT PARQUET)")
+preview = con.execute("SELECT * FROM dim_revenue_tag_choice ORDER BY cik LIMIT 10").fetch_df()
+
+# Quick proof for Apple
+apple = con.execute("""
+  SELECT * FROM dim_revenue_tag_choice WHERE cik = 320193
+""").fetch_df()
+
+con.close()
+print("✅ Wrote:", OUT)
+print("Preview:\n", preview)
+print("\nApple choice:\n", apple)
+# Universal Revenue mart (annual + quarterly) using per-CIK chosen tag
+import os, duckdb
+
+RAW      = r"C:\smilefund_project\warehouse\parquet\_raw_deltas\**\*.parquet"
+DIM_REV  = r"C:\smilefund_project\warehouse\parquet\dimensions\dim_revenue_tag_choice.parquet"
+OUT_DIR  = r"C:\smilefund_project\warehouse\parquet\marts"
+REV_ANNU = os.path.join(OUT_DIR, "revenue_annual.parquet")
+REV_QTR  = os.path.join(OUT_DIR, "revenue_quarterly.parquet")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+# Normalize RAW and join to chosen revenue tag per CIK
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW raw_norm AS
+  SELECT
+    TRY_CAST(cik AS BIGINT) AS cik,
+    CASE WHEN position(':' IN xbrl_tag) > 0 THEN split_part(xbrl_tag,':',2) ELSE xbrl_tag END AS tag,
+    TRY_CAST(fy AS INTEGER) AS fy,
+    CAST(fp AS VARCHAR)     AS fp,
+    TRY_CAST(value AS DOUBLE) AS val
+  FROM parquet_scan('{RAW}')
+  WHERE value IS NOT NULL AND xbrl_tag IS NOT NULL AND xbrl_tag <> ''
+""")
+
+con.execute(f"CREATE OR REPLACE TEMP VIEW dim_choice AS SELECT * FROM read_parquet('{DIM_REV}')")
+
+# Restrict RAW to the chosen tag for each CIK
+con.execute("""
+  CREATE OR REPLACE TEMP VIEW rev_chosen AS
+  SELECT r.cik, r.fy, r.fp, r.val
+  FROM raw_norm r
+  JOIN dim_choice d
+    ON r.cik = d.cik AND r.tag = d.chosen_revenue_tag
+""")
+
+# Helper to rank FY/Qs
+con.execute("""
+  CREATE OR REPLACE TEMP VIEW rev_ranked AS
+  SELECT *,
+         CASE fp WHEN 'FY' THEN 5 WHEN 'Q4' THEN 4 WHEN 'Q3' THEN 3 WHEN 'Q2' THEN 2 WHEN 'Q1' THEN 1 ELSE 0 END AS fp_rank
+  FROM rev_chosen
+""")
+
+# Annual mart (one row per cik, fy)
+con.execute(f"""
+  COPY (
+    WITH z AS (
+      SELECT cik, fy, val,
+             ROW_NUMBER() OVER (PARTITION BY cik, fy ORDER BY fp_rank DESC) rn
+      FROM rev_ranked
+      WHERE fp = 'FY'
+    )
+    SELECT cik, fy, val AS Revenue
+    FROM z WHERE rn = 1
+    ORDER BY cik, fy
+  ) TO '{REV_ANNU}' (FORMAT PARQUET)
+""")
+
+# Quarterly mart (one row per cik, fy, fp)
+con.execute(f"""
+  COPY (
+    WITH z AS (
+      SELECT cik, fy, fp, val,
+             ROW_NUMBER() OVER (PARTITION BY cik, fy, fp ORDER BY fp_rank DESC) rn
+      FROM rev_ranked
+      WHERE fp IN ('Q1','Q2','Q3','Q4')
+    )
+    SELECT cik, fy, fp, val AS Revenue
+    FROM z WHERE rn = 1
+    ORDER BY cik, fy,
+      CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 ELSE 0 END
+  ) TO '{REV_QTR}' (FORMAT PARQUET)
+""")
+
+# Quick Apple sanity (CIK 320193)
+apple_annual   = con.execute(f"SELECT * FROM read_parquet('{REV_ANNU}') WHERE cik=320193 ORDER BY fy").fetch_df()
+apple_quarter  = con.execute(f"SELECT * FROM read_parquet('{REV_QTR}') WHERE cik=320193 ORDER BY fy, CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END").fetch_df()
+apple_choice   = con.execute("SELECT * FROM dim_choice WHERE cik=320193").fetch_df()
+
+con.close()
+
+print("✅ Wrote:")
+print(" -", REV_ANNU)
+print(" -", REV_QTR)
+print("\nApple chosen tag:\n", apple_choice)
+print("\nApple annual (tail):\n", apple_annual.tail(10))
+print("\nApple quarterly (tail):\n", apple_quarter.tail(12))
+# Rebuild dim_revenue_tag_choice using FY coverage → rebuild revenue marts → re-check Apple
+import os, duckdb
+
+RAW      = r"C:\smilefund_project\warehouse\parquet\_raw_deltas\**\*.parquet"
+OUT_DIM  = r"C:\smilefund_project\warehouse\parquet\dimensions\dim_revenue_tag_choice.parquet"
+OUT_DIR  = r"C:\smilefund_project\warehouse\parquet\marts"
+REV_ANNU = os.path.join(OUT_DIR, "revenue_annual.parquet")
+REV_QTR  = os.path.join(OUT_DIR, "revenue_quarterly.parquet")
+os.makedirs(os.path.dirname(OUT_DIM), exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+# 1) Normalize RAW once
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW raw_norm AS
+  SELECT
+    TRY_CAST(cik AS BIGINT) AS cik,
+    CASE WHEN position(':' IN xbrl_tag) > 0 THEN split_part(xbrl_tag,':',2) ELSE xbrl_tag END AS tag,
+    TRY_CAST(fy AS INTEGER) AS fy,
+    CAST(fp AS VARCHAR)     AS fp,
+    TRY_CAST(value AS DOUBLE) AS val
+  FROM parquet_scan('{RAW}')
+  WHERE value IS NOT NULL AND xbrl_tag IS NOT NULL AND xbrl_tag <> ''
+""")
+
+# 2) Candidate revenue tags (ordered by preference)
+CANDS = (
+  'Revenues',
+  'SalesRevenueNet',
+  'RevenueFromContractWithCustomerExcludingAssessedTax',
+  'SalesRevenueGoodsAndServicesNet',
+  'SalesRevenueGoodsNet',
+  'SalesRevenueServicesNet',
+  'TotalRevenueAndOtherIncome'
+)
+cand_sql = ",".join([f"'{t}'" for t in CANDS])
+
+# 3) Score tags per CIK:
+#    - fy_coverage: how many DISTINCT fiscal years have an FY row for this tag
+#    - pref: our human preference order
+#    - total_rows: total rows (ties breaker)
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW rev_scores AS
+  SELECT
+    cik,
+    tag,
+    COUNT(*) FILTER (WHERE fp='FY')                         AS fy_rows,
+    COUNT(DISTINCT CASE WHEN fp='FY' THEN fy END)           AS fy_coverage,
+    COUNT(*)                                                AS total_rows,
+    MIN(CASE tag
+          WHEN 'Revenues' THEN 1
+          WHEN 'SalesRevenueNet' THEN 2
+          WHEN 'RevenueFromContractWithCustomerExcludingAssessedTax' THEN 3
+          WHEN 'SalesRevenueGoodsAndServicesNet' THEN 4
+          WHEN 'SalesRevenueGoodsNet' THEN 5
+          WHEN 'SalesRevenueServicesNet' THEN 6
+          WHEN 'TotalRevenueAndOtherIncome' THEN 7
+          ELSE 99 END)                                      AS pref
+  FROM raw_norm
+  WHERE tag IN ({cand_sql})
+  GROUP BY cik, tag
+""")
+
+# 4) Choose best tag per CIK:
+#    First by fy_coverage (DESC), then by pref (ASC), then by total_rows (DESC)
+con.execute("""
+  CREATE OR REPLACE TABLE dim_revenue_tag_choice AS
+  SELECT cik, tag AS chosen_revenue_tag
+  FROM (
+    SELECT
+      cik, tag, fy_coverage, pref, total_rows,
+      ROW_NUMBER() OVER (
+        PARTITION BY cik
+        ORDER BY fy_coverage DESC, pref ASC, total_rows DESC
+      ) AS rn
+    FROM rev_scores
+  )
+  WHERE rn = 1
+""")
+con.execute(f"COPY dim_revenue_tag_choice TO '{OUT_DIM}' (FORMAT PARQUET)")
+
+# 5) Build marts from the chosen tag
+con.execute(f"CREATE OR REPLACE TEMP VIEW dim_choice AS SELECT * FROM read_parquet('{OUT_DIM}')")
+con.execute("""
+  CREATE OR REPLACE TEMP VIEW rev_chosen AS
+  SELECT r.cik, r.fy, r.fp, r.val
+  FROM raw_norm r
+  JOIN dim_choice d ON r.cik = d.cik AND r.tag = d.chosen_revenue_tag
+""")
+con.execute("""
+  CREATE OR REPLACE TEMP VIEW rev_ranked AS
+  SELECT *,
+         CASE fp WHEN 'FY' THEN 5 WHEN 'Q4' THEN 4 WHEN 'Q3' THEN 3 WHEN 'Q2' THEN 2 WHEN 'Q1' THEN 1 ELSE 0 END AS fp_rank
+  FROM rev_chosen
+""")
+
+# Annual mart
+con.execute(f"""
+  COPY (
+    WITH z AS (
+      SELECT cik, fy, val,
+             ROW_NUMBER() OVER (PARTITION BY cik, fy ORDER BY fp_rank DESC) rn
+      FROM rev_ranked
+      WHERE fp='FY'
+    )
+    SELECT cik, fy, val AS Revenue
+    FROM z WHERE rn=1
+    ORDER BY cik, fy
+  ) TO '{REV_ANNU}' (FORMAT PARQUET)
+""")
+
+# Quarterly mart
+con.execute(f"""
+  COPY (
+    WITH z AS (
+      SELECT cik, fy, fp, val,
+             ROW_NUMBER() OVER (PARTITION BY cik, fy, fp ORDER BY fp_rank DESC) rn
+      FROM rev_ranked
+      WHERE fp IN ('Q1','Q2','Q3','Q4')
+    )
+    SELECT cik, fy, fp, val AS Revenue
+    FROM z WHERE rn=1
+    ORDER BY cik, fy,
+      CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END
+  ) TO '{REV_QTR}' (FORMAT PARQUET)
+""")
+
+# 6) Apple sanity check
+apple_choice = con.execute("SELECT * FROM dim_revenue_tag_choice WHERE cik=320193").fetch_df()
+apple_annual = con.execute(f"SELECT * FROM read_parquet('{REV_ANNU}') WHERE cik=320193 ORDER BY fy").fetch_df()
+apple_quarter= con.execute(f"""
+  SELECT * FROM read_parquet('{REV_QTR}') WHERE cik=320193
+  ORDER BY fy, CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END
+""").fetch_df()
+con.close()
+
+print("✅ Rewrote:", OUT_DIM)
+print("Apple chosen tag now:\n", apple_choice)
+print("\nApple annual (tail):\n", apple_annual.tail(10))
+print("\nApple quarterly (tail):\n", apple_quarter.tail(12))
+# Build a view that returns Q1, Q2, Q3, and the FY delta (10-K minus Q1+Q2+Q3) for every cik/fy.
+import os, duckdb, pandas as pd
+
+REV_QTR = r"C:\smilefund_project\warehouse\parquet\marts\revenue_quarterly.parquet"
+REV_ANNU= r"C:\smilefund_project\warehouse\parquet\marts\revenue_annual.parquet"
+OUT_DIR = r"C:\smilefund_project\warehouse\reports"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+# Create/replace a view you can reuse in any query
+con.execute(f"""
+CREATE OR REPLACE VIEW vw_revenue_q13_plus_fydelta AS
+WITH q AS (
+  SELECT
+    cik,
+    fy,
+    fp,
+    Revenue AS amount,
+    CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 ELSE NULL END AS qn
+  FROM read_parquet('{REV_QTR}')
+  WHERE fp IN ('Q1','Q2','Q3')  -- only first three quarters
+),
+ytd3 AS (
+  SELECT cik, fy, SUM(amount) AS ytd3
+  FROM q
+  GROUP BY cik, fy
+),
+fy AS (
+  SELECT cik, fy, Revenue AS fy_amount
+  FROM read_parquet('{REV_ANNU}')
+),
+delta AS (
+  -- FY delta = 10-K FY - (Q1+Q2+Q3); if a quarter is missing, the delta naturally reflects that
+  SELECT
+    fy.cik, fy.fy,
+    (fy.fy_amount - COALESCE(ytd3.ytd3, 0.0)) AS amount
+  FROM fy
+  LEFT JOIN ytd3 ON ytd3.cik = fy.cik AND ytd3.fy = fy.fy
+),
+rows_q AS (
+  SELECT cik, fy, fp AS label, amount, qn AS order_in_fy, 'reported' AS source
+  FROM q
+),
+rows_delta AS (
+  SELECT cik, fy, '10K delta' AS label, amount, 4 AS order_in_fy, 'computed' AS source
+  FROM delta
+)
+SELECT *
+FROM (
+  SELECT * FROM rows_q
+  UNION ALL
+  SELECT * FROM rows_delta
+)
+WHERE amount IS NOT NULL
+-- optional: drop zero/negative deltas if you don't want them
+-- AND amount > 0
+;
+""")
+
+# EXAMPLE: export Apple (CIK 320193) in the desired order
+CIK = 320193
+df = con.execute(f"""
+  SELECT cik, fy, label, amount, order_in_fy
+  FROM vw_revenue_q13_plus_fydelta
+  WHERE cik = {CIK}
+  ORDER BY fy, order_in_fy
+""").fetch_df()
+
+csv_path = os.path.join(OUT_DIR, "AAPL_revenue_Q1_Q2_Q3_FYdelta.csv")
+df.to_csv(csv_path, index=False)
+con.close()
+
+print(f"✅ Wrote {csv_path} ({len(df)} rows)")
+print(df.tail(12))
+import duckdb, os, pandas as pd
+
+REV_QTR = r"C:\smilefund_project\warehouse\parquet\marts\revenue_quarterly.parquet"
+REV_ANNU= r"C:\smilefund_project\warehouse\parquet\marts\revenue_annual.parquet"
+OUT_DIR = r"C:\smilefund_project\warehouse\reports"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+# Build the de-YTD logic as a view
+con.execute(f"""
+CREATE OR REPLACE VIEW vw_revenue_quarters_true AS
+WITH q_raw AS (
+  SELECT
+    cik, fy, fp,
+    Revenue AS ytd_amount,
+    CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END AS qn
+  FROM read_parquet('{REV_QTR}')
+  WHERE fp IN ('Q1','Q2','Q3')
+),
+q_delta AS (
+  SELECT q1.cik, q1.fy, q1.fp, q1.ytd_amount AS amount, q1.qn
+  FROM q_raw q1 WHERE q1.fp='Q1'
+  UNION ALL
+  SELECT q2.cik, q2.fy, 'Q2' AS fp, (q2.ytd_amount - q1.ytd_amount) AS amount, 2 AS qn
+  FROM q_raw q2
+  JOIN q_raw q1 ON q1.cik=q2.cik AND q1.fy=q2.fy AND q1.fp='Q1'
+  UNION ALL
+  SELECT q3.cik, q3.fy, 'Q3' AS fp, (q3.ytd_amount - q2.ytd_amount) AS amount, 3 AS qn
+  FROM q_raw q3
+  JOIN q_raw q2 ON q2.cik=q3.cik AND q2.fy=q3.fy AND q2.fp='Q2'
+),
+fy AS (
+  SELECT cik, fy, Revenue AS fy_amount
+  FROM read_parquet('{REV_ANNU}')
+),
+ytd3 AS (
+  SELECT cik, fy, SUM(amount) AS total_3q
+  FROM q_delta
+  GROUP BY cik, fy
+),
+fy_delta AS (
+  SELECT f.cik, f.fy, (f.fy_amount - COALESCE(y.total_3q,0)) AS amount, 4 AS qn, '10K delta' AS fp
+  FROM fy f LEFT JOIN ytd3 y ON f.cik=y.cik AND f.fy=y.fy
+)
+SELECT *
+FROM (
+  SELECT * FROM q_delta
+  UNION ALL
+  SELECT * FROM fy_delta
+)
+WHERE amount IS NOT NULL
+ORDER BY cik, fy, qn
+""")
+
+# Example export: Apple (CIK 320193)
+CIK = 320193
+df = con.execute(f"""
+  SELECT cik, fy, fp, amount AS Revenue
+  FROM vw_revenue_quarters_true
+  WHERE cik = {CIK}
+  ORDER BY fy, CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN '10K delta' THEN 4 END
+""").fetch_df()
+
+csv_path = os.path.join(OUT_DIR, "AAPL_revenue_quarters_true.csv")
+df.to_csv(csv_path, index=False)
+con.close()
+
+print(f"✅ Wrote {csv_path} ({len(df)} rows)")
+print(df.tail(12))
+import duckdb, os, pandas as pd
+
+REV_QTR = r"C:\smilefund_project\warehouse\parquet\marts\revenue_quarterly.parquet"
+REV_ANNU= r"C:\smilefund_project\warehouse\parquet\marts\revenue_annual.parquet"
+OUT_DIR = r"C:\smilefund_project\warehouse\reports"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+con.execute(f"""
+CREATE OR REPLACE VIEW vw_revenue_quarters_true AS
+WITH q_raw AS (
+  SELECT
+    cik,
+    fy,
+    fp,
+    Revenue AS ytd_amount,
+    CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END AS qn
+  FROM read_parquet('{REV_QTR}')
+  WHERE fp IN ('Q1','Q2','Q3')
+),
+q1 AS (
+  SELECT cik, fy, 'Q1' AS fp, ytd_amount AS amount, 1 AS qn
+  FROM q_raw
+  WHERE fp = 'Q1'
+),
+q2 AS (
+  SELECT q2.cik, q2.fy, 'Q2' AS fp,
+         (q2.ytd_amount - COALESCE(q1.ytd_amount, 0)) AS amount,
+         2 AS qn
+  FROM q_raw q2
+  LEFT JOIN q_raw q1
+    ON q1.cik = q2.cik AND q1.fy = q2.fy AND q1.fp = 'Q1'
+  WHERE q2.fp = 'Q2'
+),
+q3 AS (
+  SELECT q3.cik, q3.fy, 'Q3' AS fp,
+         (q3.ytd_amount - COALESCE(q2.ytd_amount, 0)) AS amount,
+         3 AS qn
+  FROM q_raw q3
+  LEFT JOIN q_raw q2
+    ON q2.cik = q3.cik AND q2.fy = q3.fy AND q2.fp = 'Q2'
+  WHERE q3.fp = 'Q3'
+),
+rows_q AS (  -- ensure identical column order & names
+  SELECT cik, fy, fp, amount, qn FROM q1
+  UNION ALL
+  SELECT cik, fy, fp, amount, qn FROM q2
+  UNION ALL
+  SELECT cik, fy, fp, amount, qn FROM q3
+),
+fy AS (
+  SELECT cik, fy, Revenue AS fy_amount
+  FROM read_parquet('{REV_ANNU}')
+),
+ytd3 AS (
+  SELECT cik, fy, SUM(amount) AS total_3q
+  FROM rows_q
+  GROUP BY cik, fy
+),
+fy_delta AS (
+  SELECT
+    fy.cik,
+    fy.fy,
+    '10K delta' AS fp,                       -- place fp third
+    (fy.fy_amount - COALESCE(ytd3.total_3q, 0)) AS amount,
+    4 AS qn
+  FROM fy
+  LEFT JOIN ytd3 ON ytd3.cik = fy.cik AND ytd3.fy = fy.fy
+)
+SELECT *
+FROM (
+  SELECT cik, fy, fp, amount, qn FROM rows_q
+  UNION ALL
+  SELECT cik, fy, fp, amount, qn FROM fy_delta
+)
+WHERE amount IS NOT NULL
+ORDER BY cik, fy, qn;
+""")
+
+# Example export: Apple
+CIK = 320193
+df = con.execute(f"""
+  SELECT cik, fy, fp, amount AS Revenue
+  FROM vw_revenue_quarters_true
+  WHERE cik = {CIK}
+  ORDER BY fy, CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN '10K delta' THEN 4 END
+""").fetch_df()
+
+csv_path = os.path.join(OUT_DIR, "AAPL_revenue_quarters_true.csv")
+df.to_csv(csv_path, index=False)
+con.close()
+
+print(f"✅ Wrote {csv_path} ({len(df)} rows)")
+print(df.tail(12))
+import duckdb
+
+RAW = r"C:\smilefund_project\warehouse\parquet\_raw_deltas\**\*.parquet"
+
+con = duckdb.connect()
+df = con.execute(f"""
+  WITH raw_norm AS (
+    SELECT
+      TRY_CAST(cik AS BIGINT) AS cik,
+      CASE WHEN position(':' IN xbrl_tag) > 0 THEN split_part(xbrl_tag,':',2) ELSE xbrl_tag END AS tag,
+      TRY_CAST(fy AS INTEGER) AS fy,
+      CAST(fp AS VARCHAR)     AS fp,
+      TRY_CAST(value AS DOUBLE) AS val,
+      CAST(period_end AS DATE) AS period_end,
+      CAST(filed_date AS DATE) AS filed_date,
+      form_type AS form
+    FROM parquet_scan('{RAW}')
+    WHERE TRY_CAST(cik AS BIGINT)=320193
+      AND xbrl_tag IS NOT NULL AND xbrl_tag <> ''
+      AND value IS NOT NULL
+  )
+  SELECT fy, fp, period_end, filed_date, form, val
+  FROM raw_norm
+  WHERE tag IN ('SalesRevenueNet','Revenues','RevenueFromContractWithCustomerExcludingAssessedTax')
+    AND fp IN ('Q1','Q2','Q3')
+  ORDER BY period_end, filed_date
+""").fetch_df()
+con.close()
+
+print(df.tail(30))
