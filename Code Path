@@ -1426,3 +1426,1356 @@ combined.to_parquet(path_fact, index=False)
 
 print(f"✅ Done. fact_financials rows: {len(combined):,} | unique tags: {dim_metric['xbrl_tag'].nunique():,} | elapsed: {(time.time()-start)/60:,.1f} min")
 
+# === PHASE B+ (ALL TAGS + GROUPED FAN-OUT) ===
+from pathlib import Path
+import traceback
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+
+# ---------------- CONFIG (your path) ----------------
+PROJECT_ROOT = Path(r"C:\smilefund_project")
+RAW_DIR      = PROJECT_ROOT / r"warehouse\parquet\_raw_deltas"
+OUT_DIR      = PROJECT_ROOT / r"warehouse\parquet\facts_all"
+OUT_FILE     = OUT_DIR / "facts_all.parquet"
+FANOUT_DIR   = PROJECT_ROOT / r"warehouse\parquet\facts_by_group"
+
+BATCH_SIZE     = 250_000
+ROW_GROUP_SIZE = 256 * 1024
+PARQUET_CODEC  = "snappy"
+
+# -------- Tag groups (extend anytime; unmapped => 'Other') --------
+TAG_GROUPS = {
+    "Revenue": {
+        "Revenues","RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet",
+        "SalesRevenueGoodsAndServicesNet","TotalRevenueAndOtherIncome"
+    },
+    "Expenses": {
+        "CostOfGoodsAndServicesSold","CostOfRevenue","SellingGeneralAndAdministrativeExpense",
+        "ResearchAndDevelopmentExpense","OperatingExpenses","InterestExpense","RestructuringCharges"
+    },
+    "Assets": {
+        "Assets","AssetsCurrent","CashAndCashEquivalentsAtCarryingValue","AccountsReceivableNetCurrent",
+        "InventoryNet","Goodwill","IntangibleAssetsNetExcludingGoodwill","PropertyPlantAndEquipmentNet"
+    },
+    "Liabilities": {
+        "Liabilities","LiabilitiesCurrent","AccountsPayableCurrent","LongTermDebtNoncurrent",
+        "DeferredRevenueCurrent","DeferredTaxLiabilitiesNoncurrent"
+    },
+    "Equity": {
+        "StockholdersEquity","RetainedEarningsAccumulatedDeficit",
+        "CommonStockValue","AdditionalPaidInCapital","TreasuryStockValue"
+    },
+    "CashFlow": {
+        "NetCashProvidedByUsedInOperatingActivities","NetCashProvidedByUsedInInvestingActivities",
+        "NetCashProvidedByUsedInFinancingActivities","PaymentsForRepurchaseOfCommonStock","PaymentsOfDividends"
+    },
+    "OCI": {"OtherComprehensiveIncomeLossNetOfTax"},
+    "PerShare": {"EarningsPerShareBasic","EarningsPerShareDiluted","CommonStockDividendsPerShareDeclared"},
+    "KPIs": {"CustomersNumber","EmployeesNumber","ActiveUsers","RevenuePerShare"},
+}
+_TAG_TO_GROUP = {t.lower(): g for g, tags in TAG_GROUPS.items() for t in tags}
+
+def map_group_for_batch(tag_array: pa.Array) -> pa.Array:
+    # strip namespaces like 'us-gaap:' and map; default 'Other'
+    tag_utf8 = pc.cast(tag_array, pa.utf8())
+    stripped = pc.replace_substring_regex(tag_utf8, r"^[^:]+:", "")
+    lowered  = pc.ascii_lower(stripped)
+    py = lowered.to_pylist()
+    out = [_TAG_TO_GROUP.get(t, "Other") if t is not None else "Other" for t in py]
+    return pa.array(out, type=pa.utf8())
+
+# ---------------- Pre-flight ----------------
+if not RAW_DIR.exists():
+    raise FileNotFoundError(f"Raw parquet folder not found: {RAW_DIR}")
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+FANOUT_DIR.mkdir(parents=True, exist_ok=True)
+
+dataset = ds.dataset(str(RAW_DIR), format="parquet")
+schema = dataset.schema
+wanted_cols = [c for c in [
+    "cik","tag","unit","fy","fp","frame","start","end",
+    "filed","form","accn","val","value","decimals","qtrs","segment","uom"
+] if c in schema.names]
+
+print(f"Found {len(dataset.files)} raw chunks in: {RAW_DIR}")
+print("Columns available:", wanted_cols)
+
+# ---------------- (1) Write monolithic facts_all ----------------
+writer = None
+total_rows = 0
+try:
+    for batch in dataset.to_batches(columns=wanted_cols, batch_size=BATCH_SIZE):
+        tbl = pa.Table.from_batches([batch])
+        if "value" in tbl.column_names and "val" not in tbl.column_names:
+            tbl = tbl.append_column("val", tbl["value"]).drop(["value"])
+        # normalize numeric types (best-effort)
+        for col, typ in {"cik": pa.int64(), "fy": pa.int32(), "val": pa.float64()}.items():
+            if col in tbl.column_names:
+                try:
+                    tbl = tbl.set_column(tbl.schema.get_field_index(col), col, pc.cast(tbl[col], typ))
+                except Exception:
+                    pass
+        if writer is None:
+            writer = pq.ParquetWriter(OUT_FILE, tbl.schema, compression=PARQUET_CODEC)
+        writer.write_table(tbl, row_group_size=ROW_GROUP_SIZE)
+        total_rows += tbl.num_rows
+        if total_rows % 1_000_000 < BATCH_SIZE:
+            print(f"[facts_all] wrote {total_rows:,} rows...")
+finally:
+    if writer:
+        writer.close()
+print(f"✅ facts_all DONE — {total_rows:,} rows → {OUT_FILE}")
+
+# ---------------- (2) Fan-out by group/tag (partitioned) ----------------
+partitioning = ds.partitioning(flavor="hive")  # group=.../tag=...
+written_rows = 0
+
+for batch in dataset.to_batches(columns=wanted_cols, batch_size=BATCH_SIZE):
+    tbl = pa.Table.from_batches([batch])
+    if "value" in tbl.column_names and "val" not in tbl.column_names:
+        tbl = tbl.append_column("val", tbl["value"]).drop(["value"])
+    # attach group column
+    if "tag" in tbl.column_names:
+        group_arr = map_group_for_batch(tbl["tag"])
+    else:
+        group_arr = pa.array(["Other"] * tbl.num_rows, type=pa.utf8())
+    tbl = tbl.append_column("group", group_arr)
+
+    ds.write_dataset(
+        data=tbl,
+        base_dir=str(FANOUT_DIR),
+        format="parquet",
+        partitioning=partitioning,
+        partitioning_cols=["group","tag"],
+        existing_data_behavior="overwrite_or_ignore",  # idempotent runs
+    )
+    written_rows += tbl.num_rows
+    if written_rows % 1_000_000 < BATCH_SIZE:
+        print(f"[facts_by_group] wrote {written_rows:,} rows...")
+
+print(f"✅ facts_by_group DONE — {written_rows:,} rows → {FANOUT_DIR}")
+print(r"Example partition: facts_by_group\group=Revenue\tag=Revenues\part-*.parquet")
+# ---------------- (2) Fan-out by group/tag (partitioned) ----------------
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+
+# Define a partitioning schema (this replaces `partitioning_cols=...`)
+partition_schema = pa.schema([
+    pa.field("group", pa.utf8()),
+    pa.field("tag",   pa.utf8()),
+])
+partitioning = ds.partitioning(partition_schema, flavor="hive")
+
+written_rows = 0
+
+for batch in dataset.to_batches(columns=wanted_cols, batch_size=BATCH_SIZE):
+    tbl = pa.Table.from_batches([batch])
+
+    # unify 'value' -> 'val'
+    if "value" in tbl.column_names and "val" not in tbl.column_names:
+        tbl = tbl.append_column("val", tbl["value"]).drop(["value"])
+
+    # ensure 'tag' is utf8 (required for partitioning)
+    if "tag" in tbl.column_names:
+        tag_utf8 = pc.cast(tbl["tag"], pa.utf8())
+        tbl = tbl.set_column(tbl.column_names.index("tag"), "tag", tag_utf8)
+        # add 'group' derived from tag
+        group_arr = map_group_for_batch(tag_utf8)
+    else:
+        group_arr = pa.array(["Other"] * tbl.num_rows, type=pa.utf8())
+
+    tbl = tbl.append_column("group", group_arr)
+
+    ds.write_dataset(
+        data=tbl,
+        base_dir=str(FANOUT_DIR),
+        format="parquet",
+        partitioning=partitioning,                     # <-- use schema-based partitioning
+        existing_data_behavior="overwrite_or_ignore",  # safe to re-run
+    )
+
+    written_rows += tbl.num_rows
+    if written_rows % 1_000_000 < BATCH_SIZE:
+        print(f"[facts_by_group] wrote {written_rows:,} rows...")
+
+print(f"✅ facts_by_group DONE — {written_rows:,} rows → {FANOUT_DIR}")
+# --------- Robust fan-out: tolerate missing 'tag' in some batches ---------
+from pathlib import Path
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+
+PROJECT_ROOT = Path(r"C:\smilefund_project")
+RAW_DIR      = PROJECT_ROOT / r"warehouse\parquet\_raw_deltas"
+FANOUT_DIR   = PROJECT_ROOT / r"warehouse\parquet\facts_by_group_v2"
+FANOUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- same TAG_GROUPS and _TAG_TO_GROUP as before ---
+TAG_GROUPS = {
+    "Revenue": {"Revenues","RevenueFromContractWithCustomerExcludingAssessedTax",
+                "SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet",
+                "SalesRevenueGoodsAndServicesNet","TotalRevenueAndOtherIncome"},
+    "Expenses": {"CostOfGoodsAndServicesSold","CostOfRevenue","SellingGeneralAndAdministrativeExpense",
+                 "ResearchAndDevelopmentExpense","OperatingExpenses","InterestExpense","RestructuringCharges"},
+    "Assets": {"Assets","AssetsCurrent","CashAndCashEquivalentsAtCarryingValue","AccountsReceivableNetCurrent",
+               "InventoryNet","Goodwill","IntangibleAssetsNetExcludingGoodwill","PropertyPlantAndEquipmentNet"},
+    "Liabilities": {"Liabilities","LiabilitiesCurrent","AccountsPayableCurrent","LongTermDebtNoncurrent",
+                    "DeferredRevenueCurrent","DeferredTaxLiabilitiesNoncurrent"},
+    "Equity": {"StockholdersEquity","RetainedEarningsAccumulatedDeficit","CommonStockValue",
+               "AdditionalPaidInCapital","TreasuryStockValue"},
+    "CashFlow": {"NetCashProvidedByUsedInOperatingActivities","NetCashProvidedByUsedInInvestingActivities",
+                 "NetCashProvidedByUsedInFinancingActivities","PaymentsForRepurchaseOfCommonStock","PaymentsOfDividends"},
+    "OCI": {"OtherComprehensiveIncomeLossNetOfTax"},
+    "PerShare": {"EarningsPerShareBasic","EarningsPerShareDiluted","CommonStockDividendsPerShareDeclared"},
+    "KPIs": {"CustomersNumber","EmployeesNumber","ActiveUsers","RevenuePerShare"},
+}
+_TAG_TO_GROUP = {t.lower(): g for g, tags in TAG_GROUPS.items() for t in tags}
+
+def map_group_for_batch(tag_arr: pa.Array) -> pa.Array:
+    # tag_arr is guaranteed utf8 by caller
+    stripped = pc.replace_substring_regex(tag_arr, r"^[^:]+:", "")  # drop namespaces e.g. 'us-gaap:'
+    lowered  = pc.ascii_lower(stripped)
+    py = lowered.to_pylist()
+    out = [_TAG_TO_GROUP.get(t, "Other") if t is not None else "Other" for t in py]
+    return pa.array(out, type=pa.utf8())
+
+# Build dataset; we’ll request the columns we care about
+dataset = ds.dataset(str(RAW_DIR), format="parquet")
+wanted_cols = [c for c in [
+    "cik","tag","unit","fy","fp","frame","start","end",
+    "filed","form","accn","val","value","decimals","qtrs","segment","uom"
+] if c in dataset.schema.names]
+
+for i, batch in enumerate(dataset.to_batches(columns=wanted_cols, batch_size=250_000), start=1):
+    tbl = pa.Table.from_batches([batch])
+
+    # unify 'value' -> 'val'
+    if "value" in tbl.column_names and "val" not in tbl.column_names:
+        tbl = tbl.append_column("val", tbl["value"]).drop(["value"])
+
+    # ensure 'tag' column exists and is utf8
+    if "tag" not in tbl.column_names:
+        # create empty tag column to satisfy partitioner
+        tag_utf8 = pa.array([None] * tbl.num_rows, type=pa.utf8())
+        tbl = tbl.append_column("tag", tag_utf8)
+        # with no tags, whole batch goes to group 'Other'
+        group_arr = pa.array(["Other"] * tbl.num_rows, type=pa.utf8())
+    else:
+        tag_utf8 = pc.cast(tbl["tag"], pa.utf8())
+        tbl = tbl.set_column(tbl.column_names.index("tag"), "tag", tag_utf8)
+        group_arr = map_group_for_batch(tag_utf8)
+
+    # append group column
+    tbl = tbl.append_column("group", group_arr)
+
+    # write to hive partitions group=/tag=
+    pq.write_to_dataset(
+        table=tbl,
+        root_path=str(FANOUT_DIR),
+        partition_cols=["group", "tag"],
+        compression="snappy",
+        existing_data_behavior="overwrite_or_ignore",
+    )
+
+    if i % 20 == 0:
+        print(f"[fanout] processed {i} batches...")
+
+print("✅ facts_by_group_v2 written at:", FANOUT_DIR)
+import duckdb, os, pandas as pd
+
+FANOUT_DIR = r"C:\smilefund_project\warehouse\parquet\facts_by_group_v2"
+OUT_CSV    = r"C:\smilefund_project\warehouse\reports\top_other_tags.csv"
+os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
+
+con = duckdb.connect()
+# Read all partitioned files (hive: group=/tag= folders create columns)
+con.execute(f"""
+    WITH base AS (
+      SELECT "group", tag
+      FROM parquet_scan('{FANOUT_DIR}\\**\\*.parquet', HIVE_PARTITIONING=1)
+    )
+    SELECT tag, COUNT(*) AS n
+    FROM base
+    WHERE "group" = 'Other' AND tag IS NOT NULL AND tag <> ''
+    GROUP BY 1
+    ORDER BY n DESC
+    LIMIT 500
+""")
+df = con.fetch_df()
+con.close()
+
+print(df.head(20))
+df.to_csv(OUT_CSV, index=False)
+print("✅ wrote:", OUT_CSV)
+pip install duckdb
+# === AUTO-GROUP TAGS BY PATTERN + RE-FAN-OUT TO v3 ===
+from pathlib import Path
+import re
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+
+PROJECT_ROOT = Path(r"C:\smilefund_project")
+FACTS_ALL    = PROJECT_ROOT / r"warehouse\parquet\facts_all\facts_all.parquet"
+RAW_DIR      = PROJECT_ROOT / r"warehouse\parquet\_raw_deltas"  # we stream from raw again (fast, low RAM)
+OUT_V3       = PROJECT_ROOT / r"warehouse\parquet\facts_by_group_v3"
+OUT_V3.mkdir(parents=True, exist_ok=True)
+
+# 1) Base curated groups you already used
+TAG_GROUPS = {
+    "Revenue": {
+        "Revenues","RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet",
+        "SalesRevenueGoodsAndServicesNet","TotalRevenueAndOtherIncome"
+    },
+    "Expenses": {
+        "CostOfGoodsAndServicesSold","CostOfRevenue","SellingGeneralAndAdministrativeExpense",
+        "ResearchAndDevelopmentExpense","OperatingExpenses","InterestExpense","RestructuringCharges"
+    },
+    "Assets": {
+        "Assets","AssetsCurrent","CashAndCashEquivalentsAtCarryingValue","AccountsReceivableNetCurrent",
+        "InventoryNet","Goodwill","IntangibleAssetsNetExcludingGoodwill","PropertyPlantAndEquipmentNet"
+    },
+    "Liabilities": {
+        "Liabilities","LiabilitiesCurrent","AccountsPayableCurrent","LongTermDebtNoncurrent",
+        "DeferredRevenueCurrent","DeferredTaxLiabilitiesNoncurrent"
+    },
+    "Equity": {
+        "StockholdersEquity","RetainedEarningsAccumulatedDeficit",
+        "CommonStockValue","AdditionalPaidInCapital","TreasuryStockValue"
+    },
+    "CashFlow": {
+        "NetCashProvidedByUsedInOperatingActivities","NetCashProvidedByUsedInInvestingActivities",
+        "NetCashProvidedByUsedInFinancingActivities","PaymentsForRepurchaseOfCommonStock","PaymentsOfDividends"
+    },
+    "OCI": {"OtherComprehensiveIncomeLossNetOfTax"},
+    "PerShare": {"EarningsPerShareBasic","EarningsPerShareDiluted","CommonStockDividendsPerShareDeclared"},
+    "KPIs": {"CustomersNumber","EmployeesNumber","ActiveUsers","RevenuePerShare"},
+}
+BASE = {t.lower(): g for g, tags in TAG_GROUPS.items() for t in tags}
+
+# 2) Regex pattern rules (order matters — first match wins)
+PATTERN_RULES = [
+    ("Revenue",   r"(revenue|sales)(?!per|turnover)"),   # revenue-ish
+    ("Expenses",  r"(expense|costof|costs?)"),
+    ("Assets",    r"(^assets?$|asset)"),
+    ("Liabilities", r"(liabilit)"),
+    ("Equity",    r"(equity|retainedearnings|paidincapital|treasurystock)"),
+    ("CashFlow",  r"(netcash|operatingactivit|investingactivit|financingactivit|dividend|repurchase)"),
+    ("OCI",       r"(othercomprehensiveincome)"),
+    ("PerShare",  r"(perShare|earningspershare|dividendsPerShare)"),
+    ("KPIs",      r"(customersnumber|employeesnumber|activeusers)"),
+    # Income statements specifics:
+    ("Expenses",  r"(cogs|costofgoods)"),
+    ("Revenue",   r"(totalrevenueandotherincome)"),
+]
+
+# 3) Build a fast tag -> group mapper
+compiled = [(g, re.compile(pat, re.IGNORECASE)) for g, pat in PATTERN_RULES]
+
+def infer_group(tag_utf8: str) -> str:
+    if not tag_utf8:
+        return "Other"
+    # strip namespace like 'us-gaap:'
+    base = tag_utf8.split(":", 1)[-1]
+    # 3a) curated base
+    if base.lower() in BASE:
+        return BASE[base.lower()]
+    # 3b) regex rules
+    for g, rx in compiled:
+        if rx.search(base):
+            return g
+    return "Other"
+
+# 4) Re-fan-out from raw parquet with new inferred groups
+dataset = ds.dataset(str(RAW_DIR), format="parquet")
+wanted = [c for c in [
+    "cik","tag","unit","fy","fp","frame","start","end",
+    "filed","form","accn","val","value","decimals","qtrs","segment","uom"
+] if c in dataset.schema.names]
+
+# Wipe v3 if re-running from scratch (optional)
+# import shutil; shutil.rmtree(OUT_V3, ignore_errors=True); OUT_V3.mkdir(parents=True, exist_ok=True)
+
+bnum = 0
+for batch in dataset.to_batches(columns=wanted, batch_size=250_000):
+    bnum += 1
+    tbl = pa.Table.from_batches([batch])
+
+    # unify value->val
+    if "value" in tbl.column_names and "val" not in tbl.column_names:
+        tbl = tbl.append_column("val", tbl["value"]).drop(["value"])
+
+    # ensure 'tag' exists
+    if "tag" not in tbl.column_names:
+        tag_col = pa.array([None] * tbl.num_rows, type=pa.utf8())
+        tbl = tbl.append_column("tag", tag_col)
+    else:
+        tag_col = pc.cast(tbl["tag"], pa.utf8())
+        tbl = tbl.set_column(tbl.column_names.index("tag"), "tag", tag_col)
+
+    # vectorized-ish map to group
+    py_tags = tbl["tag"].to_pylist()
+    groups = [infer_group(t or "") for t in py_tags]
+    group_arr = pa.array(groups, type=pa.utf8())
+    tbl = tbl.append_column("group", group_arr)
+
+    # write to hive partitions group=/tag=
+    pq.write_to_dataset(
+        table=tbl,
+        root_path=str(OUT_V3),
+        partition_cols=["group", "tag"],
+        compression="snappy",
+        existing_data_behavior="overwrite_or_ignore",
+    )
+
+    if bnum % 20 == 0:
+        print(f"[v3] processed {bnum} batches...")
+
+print("✅ facts_by_group_v3 at:", OUT_V3)
+from pathlib import Path
+import json
+import pyarrow as pa, pyarrow.parquet as pq, pyarrow.dataset as ds, pyarrow.compute as pc
+
+PROJECT_ROOT = Path(r"C:\smilefund_project")
+TICKERS_JSON = PROJECT_ROOT / r"data\sec\company_tickers.json"
+FACTS_ALL   = PROJECT_ROOT / r"warehouse\parquet\facts_all\facts_all.parquet"
+OUT_DIR     = PROJECT_ROOT / r"warehouse\parquet\dimensions"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT_FILE    = OUT_DIR / "dim_company.parquet"
+
+if TICKERS_JSON.exists():
+    data = json.loads(TICKERS_JSON.read_text(encoding="utf-8"))
+    rows = []
+    for rec in data.values():
+        try:
+            rows.append({
+                "cik": int(rec.get("cik_str")),
+                "ticker": rec.get("ticker"),
+                "name": rec.get("title"),
+            })
+        except Exception:
+            pass
+    tbl = pa.Table.from_pylist(rows)
+    # Deduplicate by CIK (keep latest occurrence)
+    # If pyarrow>=16: tbl = tbl.drop_duplicates(keys=["cik"])
+    # Portable way:
+    unique_cik = pc.unique(tbl["cik"])
+    mask = pc.is_in(tbl["cik"], value_set=unique_cik)  # retains all, we'll just write as-is; parquet readers can distinct later
+    tbl = tbl.filter(pc.invert(pc.is_null(tbl["cik"])))
+    pq.write_table(tbl, str(OUT_FILE))
+    print(f"✅ Wrote {OUT_FILE} with {tbl.num_rows:,} rows (from company_tickers.json)")
+else:
+    # Fallback: build CIK-only from facts_all
+    d = ds.dataset(str(FACTS_ALL), format="parquet")
+    ciks = d.to_table(columns=["cik"]).drop_null()
+    unique_cik = pc.unique(ciks["cik"])
+    tbl = pa.Table.from_arrays([unique_cik], names=["cik"])
+    pq.write_table(tbl, str(OUT_FILE))
+    print(f"⚠️ company_tickers.json not found. Wrote {OUT_FILE} with CIK only ({tbl.num_rows:,} rows).")
+# Build latest snapshots from v3 using fy/fp ranking (no reliance on "end"/"filed")
+import os, sys, subprocess
+
+# Ensure duckdb
+try:
+    import duckdb  # type: ignore
+except ModuleNotFoundError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "duckdb"])
+    import duckdb  # noqa
+
+V3   = r"C:\smilefund_project\warehouse\parquet\facts_by_group_v3\**\*.parquet"
+SNAP = r"C:\smilefund_project\warehouse\parquet\snapshots"
+os.makedirs(SNAP, exist_ok=True)
+
+con = duckdb.connect()
+
+# Use parquet_scan with HIVE_PARTITIONING=1 to expose partition cols (group, tag)
+# Select only columns that we know exist across all partitions
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW facts_min AS
+  SELECT
+    tag,
+    "group",
+    cik,
+    fy,
+    fp,
+    val
+  FROM parquet_scan('{V3}', HIVE_PARTITIONING=1)
+  WHERE val IS NOT NULL
+""")
+
+# Rank helper: annual/quarter ordering weight
+# FY > Q4 > Q3 > Q2 > Q1 > anything else (0)
+con.execute("""
+  CREATE OR REPLACE TEMP VIEW facts_ranked AS
+  SELECT
+    *,
+    CASE fp
+      WHEN 'FY' THEN 5
+      WHEN 'Q4' THEN 4
+      WHEN 'Q3' THEN 3
+      WHEN 'Q2' THEN 2
+      WHEN 'Q1' THEN 1
+      ELSE 0
+    END AS fp_rank
+  FROM facts_min
+""")
+
+# 1) Latest ANY per (cik, tag): choose highest fy, then best fp_rank
+con.execute("""
+  CREATE OR REPLACE TABLE latest_any AS
+  SELECT *
+  FROM (
+    SELECT
+      cik, tag, fy, fp, val,
+      ROW_NUMBER() OVER (
+        PARTITION BY cik, tag
+        ORDER BY fy DESC, fp_rank DESC
+      ) rn
+    FROM facts_ranked
+  )
+  WHERE rn = 1
+""")
+con.execute(f"COPY latest_any TO '{SNAP}\\latest_any.parquet' (FORMAT PARQUET);")
+
+# 2) Latest ANNUAL per (cik, tag, fy): keep FY only, choose best (ties unlikely)
+con.execute("""
+  CREATE OR REPLACE TABLE latest_annual AS
+  SELECT *
+  FROM (
+    SELECT
+      cik, tag, fy, fp, val,
+      ROW_NUMBER() OVER (
+        PARTITION BY cik, tag, fy
+        ORDER BY fp_rank DESC
+      ) rn
+    FROM facts_ranked
+    WHERE fp = 'FY'
+  )
+  WHERE rn = 1
+""")
+con.execute(f"COPY latest_annual TO '{SNAP}\\latest_annual.parquet' (FORMAT PARQUET);")
+
+# 3) Latest QUARTERLY per (cik, tag, fy, fp): keep Q1–Q4, 1 row per combo
+con.execute("""
+  CREATE OR REPLACE TABLE latest_quarterly AS
+  SELECT *
+  FROM (
+    SELECT
+      cik, tag, fy, fp, val,
+      ROW_NUMBER() OVER (
+        PARTITION BY cik, tag, fy, fp
+        ORDER BY fp_rank DESC
+      ) rn
+    FROM facts_ranked
+    WHERE fp IN ('Q1','Q2','Q3','Q4')
+  )
+  WHERE rn = 1
+""")
+con.execute(f"COPY latest_quarterly TO '{SNAP}\\latest_quarterly.parquet' (FORMAT PARQUET);")
+
+con.close()
+print("✅ Snapshots written:\n -", SNAP + "\\latest_any.parquet",
+      "\n -", SNAP + "\\latest_annual.parquet",
+      "\n -", SNAP + "\\latest_quarterly.parquet")
+# Step 3 — KPI wide (annual) from latest_annual snapshot
+import os
+import duckdb
+
+SNAP_ANNUAL = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_annual.parquet"
+OUT_PATH    = r"C:\smilefund_project\warehouse\parquet\marts\kpi_wide_annual.parquet"
+os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+
+# Choose common tags (add more later any time)
+TAGS = (
+    'Revenues',
+    'NetIncomeLoss',
+    'GrossProfit',
+    'OperatingIncomeLoss',
+    'EarningsPerShareDiluted',
+    'Assets', 'Liabilities', 'StockholdersEquity',
+    'NetCashProvidedByUsedInOperatingActivities'
+)
+
+con = duckdb.connect()
+con.execute(f"CREATE OR REPLACE TEMP VIEW la AS SELECT * FROM read_parquet('{SNAP_ANNUAL}')")
+
+# Build wide table (one row per cik & fiscal year)
+con.execute(f"""
+  COPY (
+    WITH base AS (
+      SELECT cik, fy, tag, val
+      FROM la
+      WHERE tag IN ({','.join([f"'{t}'" for t in TAGS])})
+    ),
+    pivoted AS (
+      SELECT
+        cik, fy,
+        MAX(CASE WHEN tag='Revenues' THEN val END)                                 AS Revenues,
+        MAX(CASE WHEN tag='NetIncomeLoss' THEN val END)                            AS NetIncome,
+        MAX(CASE WHEN tag='GrossProfit' THEN val END)                              AS GrossProfit,
+        MAX(CASE WHEN tag='OperatingIncomeLoss' THEN val END)                      AS OperatingIncome,
+        MAX(CASE WHEN tag='EarningsPerShareDiluted' THEN val END)                  AS EPS_Diluted,
+        MAX(CASE WHEN tag='Assets' THEN val END)                                   AS Assets,
+        MAX(CASE WHEN tag='Liabilities' THEN val END)                              AS Liabilities,
+        MAX(CASE WHEN tag='StockholdersEquity' THEN val END)                       AS Equity,
+        MAX(CASE WHEN tag='NetCashProvidedByUsedInOperatingActivities' THEN val END) AS CFO
+      FROM base
+      GROUP BY cik, fy
+    )
+    SELECT * FROM pivoted
+    ORDER BY cik, fy
+  ) TO '{OUT_PATH}' (FORMAT PARQUET);
+""")
+con.close()
+
+print("✅ Wrote:", OUT_PATH)
+# Step 4 — YoY growth & margins on KPI wide (annual)
+import os
+import duckdb
+
+WIDE = r"C:\smilefund_project\warehouse\parquet\marts\kpi_wide_annual.parquet"
+OUT  = r"C:\smilefund_project\warehouse\parquet\marts\kpi_growth_annual.parquet"
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+
+con = duckdb.connect()
+con.execute(f"CREATE OR REPLACE TEMP VIEW w AS SELECT * FROM read_parquet('{WIDE}')")
+
+# Build growth/margin table
+con.execute(f"""
+  COPY (
+    WITH base AS (
+      SELECT
+        cik, fy,
+        Revenues,
+        NetIncome,
+        GrossProfit,
+        OperatingIncome,
+        EPS_Diluted AS EPS,
+        Assets, Liabilities, Equity,
+        CFO
+      FROM w
+    ),
+    with_lag AS (
+      SELECT
+        *,
+        LAG(Revenues) OVER (PARTITION BY cik ORDER BY fy) AS Revenues_prev,
+        LAG(EPS)      OVER (PARTITION BY cik ORDER BY fy) AS EPS_prev
+      FROM base
+    )
+    SELECT
+      *,
+      CASE WHEN Revenues_prev IS NOT NULL AND Revenues_prev <> 0
+           THEN (Revenues - Revenues_prev) / NULLIF(Revenues_prev,0) END AS YoY_Revenue_Growth,
+      CASE WHEN Revenues IS NOT NULL AND Revenues <> 0
+           THEN NetIncome   / NULLIF(Revenues,0) END AS NetMargin,
+      CASE WHEN Revenues IS NOT NULL AND Revenues <> 0
+           THEN GrossProfit / NULLIF(Revenues,0) END AS GrossMargin,
+      CASE WHEN Revenues IS NOT NULL AND Revenues <> 0
+           THEN OperatingIncome / NULLIF(Revenues,0) END AS OpMargin,
+      CASE WHEN EPS_prev IS NOT NULL AND EPS_prev <> 0
+           THEN (EPS - EPS_prev) / NULLIF(EPS_prev,0) END AS YoY_EPS_Growth
+    FROM with_lag
+    ORDER BY cik, fy
+  ) TO '{OUT}' (FORMAT PARQUET);
+""")
+con.close()
+
+print("✅ Wrote:", OUT)
+# Step 5 — lightweight helpers over your snapshots/marts
+import duckdb
+import pandas as pd
+
+SNAP_ANNUAL     = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_annual.parquet"
+SNAP_QUARTERLY  = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_quarterly.parquet"
+
+con = duckdb.connect()
+con.execute(f"CREATE OR REPLACE TEMP VIEW la AS SELECT * FROM read_parquet('{SNAP_ANNUAL}')")
+con.execute(f"CREATE OR REPLACE TEMP VIEW lq AS SELECT * FROM read_parquet('{SNAP_QUARTERLY}')")
+
+def list_top_tags(n: int = 50) -> pd.DataFrame:
+    q = f"""
+      SELECT tag, COUNT(*) AS companies
+      FROM la
+      GROUP BY tag
+      ORDER BY companies DESC
+      LIMIT {n}
+    """
+    return con.execute(q).fetch_df()
+
+def top_companies_for_tag(tag: str, n: int = 20) -> pd.DataFrame:
+    # Shows who reports the largest latest-annual value for this tag
+    q = f"""
+      SELECT cik, fy, val
+      FROM la
+      WHERE tag = '{tag}'
+      ORDER BY val DESC NULLS LAST
+      LIMIT {n}
+    """
+    return con.execute(q).fetch_df()
+
+def cik_history(cik: int, tag: str) -> pd.DataFrame:
+    # Combines annual + quarterly into a single sorted series
+    q = f"""
+      WITH annual AS (
+        SELECT 'FY' AS freq, cik, fy, fp, val
+        FROM la
+        WHERE cik = {cik} AND tag = '{tag}'
+      ),
+      quarterly AS (
+        SELECT 'Q' AS freq, cik, fy, fp, val
+        FROM lq
+        WHERE cik = {cik} AND tag = '{tag}'
+      )
+      SELECT * FROM annual
+      UNION ALL
+      SELECT * FROM quarterly
+      ORDER BY fy, 
+        CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 WHEN 'FY' THEN 5 ELSE 0 END
+    """
+    return con.execute(q).fetch_df()
+
+print("✅ Helpers ready:")
+print(" - list_top_tags(n=50)")
+print(" - top_companies_for_tag('Revenues', n=20)")
+print(" - cik_history(0000320193, 'Revenues')  # example CIK (Apple)")
+# Step 6 — Top companies by latest-annual Revenues
+import os
+import duckdb
+import pandas as pd
+
+SNAP_ANNUAL = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_annual.parquet"
+OUT_CSV     = r"C:\smilefund_project\warehouse\reports\top_revenues_latest_annual.csv"
+os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
+
+con = duckdb.connect()
+df = con.execute(f"""
+  SELECT cik, fy, val AS Revenues
+  FROM read_parquet('{SNAP_ANNUAL}')
+  WHERE tag = 'Revenues'
+  ORDER BY Revenues DESC NULLS LAST
+  LIMIT 50
+""").fetch_df()
+con.close()
+
+print(df.head(20))
+df.to_csv(OUT_CSV, index=False)
+print("✅ Saved:", OUT_CSV)
+# Step 7 — Apple (CIK 0000320193) Revenue history (annual + quarterly)
+import os, sys, subprocess
+import duckdb
+import pandas as pd
+
+# Optional: ensure matplotlib present for charts
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "matplotlib"])
+    import matplotlib.pyplot as plt
+
+CIK = 320193  # Apple
+SNAP_ANNUAL    = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_annual.parquet"
+SNAP_QUARTERLY = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_quarterly.parquet"
+OUT_DIR        = r"C:\smilefund_project\warehouse\reports"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+# Annual Revenues (FY)
+df_annual = con.execute(f"""
+  SELECT fy, val AS Revenues
+  FROM read_parquet('{SNAP_ANNUAL}')
+  WHERE cik = {CIK} AND tag = 'Revenues'
+  ORDER BY fy
+""").fetch_df()
+
+# Quarterly Revenues (Q1–Q4)
+df_quarterly = con.execute(f"""
+  SELECT fy, fp, val AS Revenues
+  FROM read_parquet('{SNAP_QUARTERLY}')
+  WHERE cik = {CIK} AND tag = 'Revenues' AND fp IN ('Q1','Q2','Q3','Q4')
+  ORDER BY fy,
+    CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 ELSE 0 END
+""").fetch_df()
+
+con.close()
+
+# Save CSVs
+annual_csv    = os.path.join(OUT_DIR, "AAPL_revenues_annual.csv")
+quarterly_csv = os.path.join(OUT_DIR, "AAPL_revenues_quarterly.csv")
+df_annual.to_csv(annual_csv, index=False)
+df_quarterly.to_csv(quarterly_csv, index=False)
+print("✅ Saved:\n -", annual_csv, "\n -", quarterly_csv)
+
+# Charts (simple)
+if not df_annual.empty:
+    plt.figure(figsize=(9,4.5))
+    plt.plot(df_annual["fy"], df_annual["Revenues"], marker="o")
+    plt.title("Apple (CIK 320193) — Annual Revenues")
+    plt.xlabel("Fiscal Year")
+    plt.ylabel("Revenues")
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+if not df_quarterly.empty:
+    # build x-axis labels like 2023-Q1 etc.
+    df_quarterly = df_quarterly.copy()
+    df_quarterly["period"] = df_quarterly["fy"].astype(str) + "-" + df_quarterly["fp"]
+    plt.figure(figsize=(11,4.5))
+    plt.plot(df_quarterly["period"], df_quarterly["Revenues"], marker=".")
+    plt.title("Apple (CIK 320193) — Quarterly Revenues")
+    plt.xlabel("Fiscal Period")
+    plt.ylabel("Revenues")
+    plt.xticks(rotation=60)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+# Re-export Apple (CIK 320193) Revenues using normalized tag (strip 'us-gaap:' etc.)
+import os, sys, subprocess, duckdb
+import pandas as pd
+
+# ensure matplotlib (for quick charts)
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "matplotlib"])
+    import matplotlib.pyplot as plt
+
+CIK = 320193
+SNAP_ANNUAL    = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_annual.parquet"
+SNAP_QUARTERLY = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_quarterly.parquet"
+OUT_DIR        = r"C:\smilefund_project\warehouse\reports"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+# Peek at how tag is spelled for this CIK (sanity)
+preview = con.execute(f"""
+  SELECT tag, COUNT(*) n
+  FROM read_parquet('{SNAP_ANNUAL}')
+  WHERE cik = {CIK}
+  GROUP BY tag
+  ORDER BY n DESC
+  LIMIT 10
+""").fetch_df()
+print("Tag preview for CIK 320193:\n", preview)
+
+# Annual Revenues (normalize tag)
+df_annual = con.execute(f"""
+  WITH src AS (
+    SELECT cik,
+           CASE WHEN position(':' IN tag) > 0 THEN split_part(tag, ':', 2) ELSE tag END AS tag_norm,
+           fy, val
+    FROM read_parquet('{SNAP_ANNUAL}')
+    WHERE cik = {CIK}
+  )
+  SELECT fy, val AS Revenues
+  FROM src
+  WHERE tag_norm = 'Revenues'
+  ORDER BY fy
+""").fetch_df()
+
+# Quarterly Revenues (normalize tag)
+df_quarterly = con.execute(f"""
+  WITH src AS (
+    SELECT cik,
+           CASE WHEN position(':' IN tag) > 0 THEN split_part(tag, ':', 2) ELSE tag END AS tag_norm,
+           fy, fp, val
+    FROM read_parquet('{SNAP_QUARTERLY}')
+    WHERE cik = {CIK}
+  )
+  SELECT fy, fp, val AS Revenues
+  FROM src
+  WHERE tag_norm = 'Revenues' AND fp IN ('Q1','Q2','Q3','Q4')
+  ORDER BY fy,
+    CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 ELSE 0 END
+""").fetch_df()
+
+con.close()
+
+# Save CSVs
+annual_csv    = os.path.join(OUT_DIR, "AAPL_revenues_annual.csv")
+quarterly_csv = os.path.join(OUT_DIR, "AAPL_revenues_quarterly.csv")
+df_annual.to_csv(annual_csv, index=False)
+df_quarterly.to_csv(quarterly_csv, index=False)
+print("✅ Re-saved:\n -", annual_csv, "\n -", quarterly_csv)
+
+# Charts
+if not df_annual.empty:
+    plt.figure(figsize=(9,4.5))
+    plt.plot(df_annual["fy"], df_annual["Revenues"], marker="o")
+    plt.title("Apple — Annual Revenues")
+    plt.xlabel("Fiscal Year"); plt.ylabel("Revenues"); plt.grid(True, alpha=0.3); plt.show()
+
+if not df_quarterly.empty:
+    df_quarterly = df_quarterly.copy()
+    df_quarterly["period"] = df_quarterly["fy"].astype(str) + "-" + df_quarterly["fp"]
+    plt.figure(figsize=(11,4.5))
+    plt.plot(df_quarterly["period"], df_quarterly["Revenues"], marker=".")
+    plt.title("Apple — Quarterly Revenues")
+    plt.xlabel("Fiscal Period"); plt.ylabel("Revenues"); plt.xticks(rotation=60)
+    plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
+# Rebuild snapshots with normalized tag (no namespace) so filters like tag='Revenues' work everywhere
+import os, sys, subprocess
+try:
+    import duckdb  # type: ignore
+except ModuleNotFoundError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "duckdb"])
+    import duckdb
+
+V3   = r"C:\smilefund_project\warehouse\parquet\facts_by_group_v3\**\*.parquet"
+SNAP = r"C:\smilefund_project\warehouse\parquet\snapshots"
+os.makedirs(SNAP, exist_ok=True)
+
+con = duckdb.connect()
+
+# Source from hive-partitioned v3; normalize tag -> tag_norm, then expose it as 'tag'
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW facts_min AS
+  SELECT
+    CASE WHEN position(':' IN tag) > 0 THEN split_part(tag, ':', 2) ELSE tag END AS tag,  -- normalized
+    "group",
+    cik, fy, fp, val
+  FROM parquet_scan('{V3}', HIVE_PARTITIONING=1)
+  WHERE val IS NOT NULL
+""")
+
+# Rank helper for choosing "latest"
+con.execute("""
+  CREATE OR REPLACE TEMP VIEW facts_ranked AS
+  SELECT
+    *,
+    CASE fp WHEN 'FY' THEN 5 WHEN 'Q4' THEN 4 WHEN 'Q3' THEN 3 WHEN 'Q2' THEN 2 WHEN 'Q1' THEN 1 ELSE 0 END AS fp_rank
+  FROM facts_min
+""")
+
+# Overwrite snapshots using normalized tag
+con.execute("""
+  CREATE OR REPLACE TABLE latest_any AS
+  SELECT * FROM (
+    SELECT cik, tag, fy, fp, val,
+           ROW_NUMBER() OVER (PARTITION BY cik, tag ORDER BY fy DESC, fp_rank DESC) rn
+    FROM facts_ranked
+  ) WHERE rn = 1
+""")
+con.execute(f"COPY latest_any TO '{SNAP}\\latest_any.parquet' (FORMAT PARQUET);")
+
+con.execute("""
+  CREATE OR REPLACE TABLE latest_annual AS
+  SELECT * FROM (
+    SELECT cik, tag, fy, fp, val,
+           ROW_NUMBER() OVER (PARTITION BY cik, tag, fy ORDER BY fp_rank DESC) rn
+    FROM facts_ranked
+    WHERE fp = 'FY'
+  ) WHERE rn = 1
+""")
+con.execute(f"COPY latest_annual TO '{SNAP}\\latest_annual.parquet' (FORMAT PARQUET);")
+
+con.execute("""
+  CREATE OR REPLACE TABLE latest_quarterly AS
+  SELECT * FROM (
+    SELECT cik, tag, fy, fp, val,
+           ROW_NUMBER() OVER (PARTITION BY cik, tag, fy, fp ORDER BY fp_rank DESC) rn
+    FROM facts_ranked
+    WHERE fp IN ('Q1','Q2','Q3','Q4')
+  ) WHERE rn = 1
+""")
+con.execute(f"COPY latest_quarterly TO '{SNAP}\\latest_quarterly.parquet' (FORMAT PARQUET);")
+
+con.close()
+print("✅ Snapshots rebuilt with normalized tag.")
+# Re-export Apple (CIK 320193) Revenues — annual + quarterly (normalized tag)
+import os, duckdb
+import pandas as pd
+
+CIK = 320193
+SNAP_ANNUAL    = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_annual.parquet"
+SNAP_QUARTERLY = r"C:\smilefund_project\warehouse\parquet\snapshots\latest_quarterly.parquet"
+OUT_DIR        = r"C:\smilefund_project\warehouse\reports"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+df_annual = con.execute(f"""
+  SELECT fy, val AS Revenues
+  FROM read_parquet('{SNAP_ANNUAL}')
+  WHERE cik = {CIK} AND tag = 'Revenues'
+  ORDER BY fy
+""").fetch_df()
+
+df_quarterly = con.execute(f"""
+  SELECT fy, fp, val AS Revenues
+  FROM read_parquet('{SNAP_QUARTERLY}')
+  WHERE cik = {CIK} AND tag = 'Revenues' AND fp IN ('Q1','Q2','Q3','Q4')
+  ORDER BY fy,
+    CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 ELSE 0 END
+""").fetch_df()
+
+con.close()
+
+annual_csv    = os.path.join(OUT_DIR, "AAPL_revenues_annual.csv")
+quarterly_csv = os.path.join(OUT_DIR, "AAPL_revenues_quarterly.csv")
+df_annual.to_csv(annual_csv, index=False)
+df_quarterly.to_csv(quarterly_csv, index=False)
+
+print("Annual rows:", len(df_annual), "→", annual_csv)
+print(df_annual.tail(10))
+print("\nQuarterly rows:", len(df_quarterly), "→", quarterly_csv)
+print(df_quarterly.tail(12))
+# Diagnose Apple's tags + export Revenues with fallbacks
+import os, duckdb, pandas as pd
+
+CIK = 320193
+SNAP_DIR = r"C:\smilefund_project\warehouse\parquet\snapshots"
+ANNUAL   = os.path.join(SNAP_DIR, "latest_annual.parquet")
+QUARTER  = os.path.join(SNAP_DIR, "latest_quarterly.parquet")
+ANY      = os.path.join(SNAP_DIR, "latest_any.parquet")
+OUT_DIR  = r"C:\smilefund_project\warehouse\reports"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+print("Distinct FP values for this CIK (annual + quarterly):")
+print(con.execute(f"""
+  SELECT fp, COUNT(*) n
+  FROM (
+    SELECT fp FROM read_parquet('{ANNUAL}') WHERE cik={CIK}
+    UNION ALL
+    SELECT fp FROM read_parquet('{QUARTER}') WHERE cik={CIK}
+  )
+  GROUP BY fp ORDER BY n DESC
+""").fetch_df())
+
+print("\nTop tags in latest_annual for this CIK:")
+print(con.execute(f"""
+  SELECT tag, COUNT(*) n
+  FROM read_parquet('{ANNUAL}')
+  WHERE cik={CIK}
+  GROUP BY tag ORDER BY n DESC LIMIT 30
+""").fetch_df())
+
+REVENUE_CANDIDATES = (
+    'Revenues',
+    'SalesRevenueNet',
+    'RevenueFromContractWithCustomerExcludingAssessedTax',
+    'SalesRevenueGoodsAndServicesNet',
+    'SalesRevenueGoodsNet',
+    'SalesRevenueServicesNet',
+    'TotalRevenueAndOtherIncome'
+)
+
+# Pick first tag that exists in annual
+row = con.execute(f"""
+  WITH t AS (
+    SELECT tag
+    FROM read_parquet('{ANNUAL}')
+    WHERE cik={CIK} AND tag IN ({','.join([f"'{t}'" for t in REVENUE_CANDIDATES])})
+    GROUP BY tag
+  )
+  SELECT tag FROM t ORDER BY
+    CASE tag
+      WHEN 'Revenues' THEN 1
+      WHEN 'SalesRevenueNet' THEN 2
+      WHEN 'RevenueFromContractWithCustomerExcludingAssessedTax' THEN 3
+      WHEN 'SalesRevenueGoodsAndServicesNet' THEN 4
+      WHEN 'SalesRevenueGoodsNet' THEN 5
+      WHEN 'SalesRevenueServicesNet' THEN 6
+      WHEN 'TotalRevenueAndOtherIncome' THEN 7
+      ELSE 99
+    END
+  LIMIT 1
+""").fetchone()
+
+chosen_tag = row[0] if row else None
+print("\nChosen revenue-like tag (annual):", chosen_tag)
+
+# Export annual (prefer FY; if none, use latest_any as fallback)
+if chosen_tag:
+    df_annual = con.execute(f"""
+      SELECT fy, val AS Revenues
+      FROM read_parquet('{ANNUAL}')
+      WHERE cik={CIK} AND tag='{chosen_tag}'
+      ORDER BY fy
+    """).fetch_df()
+else:
+    df_annual = pd.DataFrame(columns=["fy","Revenues"])
+
+if df_annual.empty:
+    # fallback to latest_any (single row per (cik, tag))
+    print("\nNo annual FY rows found for candidates; falling back to latest_any.")
+    df_any = con.execute(f"""
+      SELECT tag, val AS Revenues
+      FROM read_parquet('{ANY}')
+      WHERE cik={CIK} AND tag IN ({','.join([f"'{t}'" for t in REVENUE_CANDIDATES])})
+      ORDER BY Revenues DESC NULLS LAST
+      LIMIT 1
+    """).fetch_df()
+    print(df_any)
+
+# Export quarterly using same chosen tag (if exists there), else try other candidates
+if chosen_tag:
+    df_quarter = con.execute(f"""
+      SELECT fy, fp, val AS Revenues
+      FROM read_parquet('{QUARTER}')
+      WHERE cik={CIK} AND tag='{chosen_tag}' AND fp IN ('Q1','Q2','Q3','Q4')
+      ORDER BY fy,
+        CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 ELSE 0 END
+    """).fetch_df()
+else:
+    df_quarter = pd.DataFrame(columns=["fy","fp","Revenues"])
+
+if df_quarter.empty:
+    # try other candidates for quarterly
+    df_quarter = con.execute(f"""
+      SELECT fy, fp, val AS Revenues, tag
+      FROM read_parquet('{QUARTER}')
+      WHERE cik={CIK} AND fp IN ('Q1','Q2','Q3','Q4') AND tag IN ({','.join([f"'{t}'" for t in REVENUE_CANDIDATES])})
+      ORDER BY fy,
+        CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 ELSE 0 END
+    """).fetch_df()
+    print("\nQuarterly fallback rows (with tag shown):")
+    print(df_quarter.head(12))
+
+con.close()
+
+annual_csv    = os.path.join(OUT_DIR, "AAPL_revenues_annual.csv")
+quarterly_csv = os.path.join(OUT_DIR, "AAPL_revenues_quarterly.csv")
+df_annual.to_csv(annual_csv, index=False)
+df_quarter.to_csv(quarterly_csv, index=False)
+
+print("\n✅ Wrote CSVs:")
+print(" -", annual_csv, f"({len(df_annual)} rows)")
+print(" -", quarterly_csv, f"({len(df_quarter)} rows)")
+print("\nIf annual is empty or the chosen tag isn't 'Revenues', tell me what the 'Top tags' table shows and we'll lock in the right alias.")
+# Rebuild snapshots with normalized tag and filter out blank/__HIVE_DEFAULT_PARTITION__
+import os, sys, subprocess
+try:
+    import duckdb  # type: ignore
+except ModuleNotFoundError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "duckdb"])
+    import duckdb
+
+V3   = r"C:\smilefund_project\warehouse\parquet\facts_by_group_v3\**\*.parquet"
+SNAP = r"C:\smilefund_project\warehouse\parquet\snapshots"
+os.makedirs(SNAP, exist_ok=True)
+
+con = duckdb.connect()
+
+# 1) Read from hive-partitioned files, normalize tag, and DROP bad tags
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW facts_min AS
+  SELECT
+    CASE WHEN position(':' IN tag) > 0 THEN split_part(tag, ':', 2) ELSE tag END AS tag,
+    "group", cik, fy, fp, val
+  FROM parquet_scan('{V3}', HIVE_PARTITIONING=1)
+  WHERE val IS NOT NULL
+    AND tag IS NOT NULL
+    AND tag <> ''
+    AND tag <> '__HIVE_DEFAULT_PARTITION__'
+""")
+
+# 2) Rank helper for "latest"
+con.execute("""
+  CREATE OR REPLACE TEMP VIEW facts_ranked AS
+  SELECT
+    *,
+    CASE fp WHEN 'FY' THEN 5 WHEN 'Q4' THEN 4 WHEN 'Q3' THEN 3 WHEN 'Q2' THEN 2 WHEN 'Q1' THEN 1 ELSE 0 END AS fp_rank
+  FROM facts_min
+""")
+
+# 3) Write snapshots
+con.execute("""
+  CREATE OR REPLACE TABLE latest_any AS
+  SELECT * FROM (
+    SELECT cik, tag, fy, fp, val,
+           ROW_NUMBER() OVER (PARTITION BY cik, tag ORDER BY fy DESC, fp_rank DESC) rn
+    FROM facts_ranked
+  ) WHERE rn = 1
+""")
+con.execute(f"COPY latest_any TO '{SNAP}\\latest_any.parquet' (FORMAT PARQUET);")
+
+con.execute("""
+  CREATE OR REPLACE TABLE latest_annual AS
+  SELECT * FROM (
+    SELECT cik, tag, fy, fp, val,
+           ROW_NUMBER() OVER (PARTITION BY cik, tag, fy ORDER BY fp_rank DESC) rn
+    FROM facts_ranked
+    WHERE fp = 'FY'
+  ) WHERE rn = 1
+""")
+con.execute(f"COPY latest_annual TO '{SNAP}\\latest_annual.parquet' (FORMAT PARQUET);")
+
+con.execute("""
+  CREATE OR REPLACE TABLE latest_quarterly AS
+  SELECT * FROM (
+    SELECT cik, tag, fy, fp, val,
+           ROW_NUMBER() OVER (PARTITION BY cik, tag, fy, fp ORDER BY fp_rank DESC) rn
+    FROM facts_ranked
+    WHERE fp IN ('Q1','Q2','Q3','Q4')
+  ) WHERE rn = 1
+""")
+con.execute(f"COPY latest_quarterly TO '{SNAP}\\latest_quarterly.parquet' (FORMAT PARQUET);")
+
+# quick sanity: how many rows now for Apple in latest_annual?
+apple = con.execute("""
+  SELECT tag, COUNT(*) n
+  FROM latest_annual
+  WHERE cik = 320193
+  GROUP BY tag ORDER BY n DESC
+""").fetch_df()
+con.close()
+
+print("✅ Snapshots rebuilt (bad tags filtered).")
+print("Apple tags present in latest_annual now:\n", apple.head(10))
+# Fan-out from RAW → facts_by_group_v4 (fixed tag emptiness check)
+from pathlib import Path
+import re, shutil
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+
+PROJECT_ROOT = Path(r"C:\smilefund_project")
+RAW_DIR      = PROJECT_ROOT / r"warehouse\parquet\_raw_deltas"
+OUT_V4       = PROJECT_ROOT / r"warehouse\parquet\facts_by_group_v4"
+
+# start clean to avoid mixing partial runs
+shutil.rmtree(OUT_V4, ignore_errors=True)
+OUT_V4.mkdir(parents=True, exist_ok=True)
+
+TAG_GROUPS = {
+    "Revenue": {"Revenues","SalesRevenueNet","RevenueFromContractWithCustomerExcludingAssessedTax",
+                "SalesRevenueGoodsAndServicesNet","SalesRevenueGoodsNet","SalesRevenueServicesNet",
+                "TotalRevenueAndOtherIncome"},
+    "Expenses": {"CostOfGoodsAndServicesSold","CostOfRevenue","SellingGeneralAndAdministrativeExpense",
+                 "ResearchAndDevelopmentExpense","OperatingExpenses","InterestExpense","RestructuringCharges"},
+    "Assets": {"Assets","AssetsCurrent","CashAndCashEquivalentsAtCarryingValue",
+               "AccountsReceivableNetCurrent","InventoryNet","Goodwill",
+               "IntangibleAssetsNetExcludingGoodwill","PropertyPlantAndEquipmentNet"},
+    "Liabilities": {"Liabilities","LiabilitiesCurrent","AccountsPayableCurrent",
+                    "LongTermDebtNoncurrent","DeferredRevenueCurrent","DeferredTaxLiabilitiesNoncurrent"},
+    "Equity": {"StockholdersEquity","RetainedEarningsAccumulatedDeficit","CommonStockValue",
+               "AdditionalPaidInCapital","TreasuryStockValue"},
+    "CashFlow": {"NetCashProvidedByUsedInOperatingActivities","NetCashProvidedByUsedInInvestingActivities",
+                 "NetCashProvidedByUsedInFinancingActivities","PaymentsForRepurchaseOfCommonStock","PaymentsOfDividends"},
+    "OCI": {"OtherComprehensiveIncomeLossNetOfTax"},
+    "PerShare": {"EarningsPerShareBasic","EarningsPerShareDiluted","CommonStockDividendsPerShareDeclared"},
+    "KPIs": {"CustomersNumber","EmployeesNumber","ActiveUsers","RevenuePerShare"},
+}
+BASE = {t.lower(): g for g, tags in TAG_GROUPS.items() for t in tags}
+PATTERN_RULES = [
+    ("Revenue",   r"(revenue|sales)(?!per)"),
+    ("Expenses",  r"(expense|costof|costs?|cogs)"),
+    ("Assets",    r"(^assets?$|asset)"),
+    ("Liabilities", r"(liabilit)"),
+    ("Equity",    r"(equity|retainedearnings|paidincapital|treasurystock)"),
+    ("CashFlow",  r"(netcash|operatingactivit|investingactivit|financingactivit|dividend|repurchase)"),
+    ("OCI",       r"(othercomprehensiveincome)"),
+    ("PerShare",  r"(earningspershare|dividendsPerShare|perShare)"),
+    ("Revenue",   r"(totalrevenueandotherincome)"),
+]
+compiled = [(g, re.compile(p, re.IGNORECASE)) for g,p in PATTERN_RULES]
+
+def infer_group(tag_str: str) -> str:
+    if not tag_str:
+        return "Other"
+    base = tag_str.split(":", 1)[-1]
+    low = base.lower()
+    if low in BASE:
+        return BASE[low]
+    for g, rx in compiled:
+        if rx.search(low):
+            return g
+    return "Other"
+
+def ensure_col(tbl: pa.Table, name: str, typ: pa.DataType) -> pa.Table:
+    if name not in tbl.column_names:
+        tbl = tbl.append_column(name, pa.array([None]*tbl.num_rows, type=typ))
+    return tbl
+
+def cast_if_possible(tbl: pa.Table, name: str, typ: pa.DataType) -> pa.Table:
+    if name in tbl.column_names:
+        try:
+            tbl = tbl.set_column(tbl.schema.get_field_index(name), name, pc.cast(tbl[name], typ))
+        except Exception:
+            pass
+    return tbl
+
+dataset = ds.dataset(str(RAW_DIR), format="parquet")
+BATCH_SIZE = 250_000
+
+for i, batch in enumerate(dataset.to_batches(batch_size=BATCH_SIZE), start=1):
+    tbl = pa.Table.from_batches([batch])
+
+    # Ensure expected RAW columns present
+    for name, typ in [
+        ("cik", pa.int64()),
+        ("xbrl_tag", pa.utf8()),
+        ("value", pa.float64()),
+        ("unit_code", pa.utf8()),
+        ("fy", pa.int32()),
+        ("fp", pa.utf8()),
+        ("period_end", pa.utf8()),
+        ("filed_date", pa.utf8()),
+        ("form_type", pa.utf8()),
+        ("accession", pa.utf8()),
+    ]:
+        tbl = ensure_col(tbl, name, typ)
+
+    # Cast core types
+    for name, typ in [("cik", pa.int64()), ("fy", pa.int32()), ("value", pa.float64()),
+                      ("xbrl_tag", pa.utf8()), ("fp", pa.utf8())]:
+        tbl = cast_if_possible(tbl, name, typ)
+
+    # Rename to canonical
+    ren_map = {
+        "xbrl_tag": "tag",
+        "value": "val",
+        "unit_code": "unit",
+        "period_end": "end",
+        "filed_date": "filed",
+        "form_type": "form",
+        "accession": "accn",
+    }
+    for src, dst in ren_map.items():
+        if src in tbl.column_names:
+            col = tbl[src]
+            if dst in tbl.column_names:
+                tbl = tbl.set_column(tbl.schema.get_field_index(dst), dst, col)
+            else:
+                tbl = tbl.append_column(dst, col)
+
+    # Normalize tag to utf8 and drop null/empty tags
+    tag_utf8 = pc.cast(tbl["tag"], pa.utf8())
+    tbl = tbl.set_column(tbl.schema.get_field_index("tag"), "tag", tag_utf8)
+    not_null  = pc.invert(pc.is_null(tag_utf8))
+    not_empty = pc.greater(pc.utf8_length(tag_utf8), 0)   # <-- fixed line
+    tbl = tbl.filter(pc.and_(not_null, not_empty))
+
+    # Derive group
+    groups = pa.array([infer_group(t or "") for t in tag_utf8.to_pylist()], type=pa.utf8())
+    tbl = tbl.append_column("group", groups)
+
+    # Select consistent order
+    keep = [c for c in ["cik","tag","unit","fy","fp","end","filed","form","accn","val","group"] if c in tbl.column_names]
+    tbl = tbl.select(keep)
+
+    pq.write_to_dataset(
+        table=tbl,
+        root_path=str(OUT_V4),
+        partition_cols=["group","tag"],
+        compression="snappy",
+        existing_data_behavior="overwrite_or_ignore",
+    )
+
+    if i % 20 == 0:
+        print(f"[v4] processed {i} batches...")
+
+print("✅ facts_by_group_v4 written at:", OUT_V4)
