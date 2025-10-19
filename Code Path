@@ -4932,3 +4932,43 @@ def main():
 
 if __name__ == "__main__":
     main()
+import pandas as pd
+from pathlib import Path
+
+BASE  = r"C:\smilefund_project"
+MARTS = rf"{BASE}\warehouse\parquet\marts"
+
+dim  = pd.read_parquet(rf"{MARTS}\dim_security.parquet")
+ttmA = pd.read_parquet(rf"{MARTS}\revenue_ttm_aligned.parquet")
+
+dim = dim[dim["cik"].isin(ttmA["cik"].unique())]
+last_ttm = (
+    ttmA.sort_values(["cik","calendar_year","qn"])
+        .groupby("cik", as_index=False)
+        .last()[["cik","calendar_year","calendar_quarter","TTM_Revenue"]]
+)
+
+vw = (dim.merge(last_ttm, on="cik", how="left")
+          .rename(columns={
+              "calendar_year":"ttm_cal_year",
+              "calendar_quarter":"ttm_cal_quarter",
+              "TTM_Revenue":"ttm_revenue"
+          }))
+
+outp = rf"{MARTS}\vw_mapped_with_ttm.parquet"
+vw.to_parquet(outp)
+print(f"✅ wrote {outp} | rows: {len(vw):,}")
+print("Null tickers:", vw['ticker'].isna().sum())
+print("Null TTM rows:", vw['ttm_revenue'].isna().sum())
+
+def chk(cik):
+    return vw.loc[vw["cik"]==cik, ["cik","company_name","ticker","ttm_cal_year","ttm_revenue"]].tail(1)
+
+print("\nNomura (1163653):")
+print(chk(1163653))
+
+print("\nWalmart (104169):")
+print(chk(104169))
+
+print("\nTop 5 by TTM:")
+print(vw.sort_values("ttm_revenue", ascending=False)[["ticker","company_name","ttm_cal_year","ttm_revenue"]].head(5))
