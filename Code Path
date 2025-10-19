@@ -3781,3 +3781,426 @@ df = con.execute(f"""
 con.close()
 
 print(df.tail(30))
+# Reconnect and rebuild quarterly revenue mart with correct row selection
+import duckdb, os
+
+RAW      = r"C:\smilefund_project\warehouse\parquet\_raw_deltas\**\*.parquet"
+DIM_REV  = r"C:\smilefund_project\warehouse\parquet\dimensions\dim_revenue_tag_choice.parquet"
+OUT_DIR  = r"C:\smilefund_project\warehouse\parquet\marts"
+REV_ANNU = os.path.join(OUT_DIR, "revenue_annual.parquet")
+REV_QTR  = os.path.join(OUT_DIR, "revenue_quarterly.parquet")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+# Normalize + join to chosen revenue tag per CIK
+con.execute(f"""
+  CREATE OR REPLACE TEMP VIEW raw_norm AS
+  SELECT
+    TRY_CAST(cik AS BIGINT) AS cik,
+    CASE WHEN position(':' IN xbrl_tag) > 0 THEN split_part(xbrl_tag,':',2) ELSE xbrl_tag END AS tag,
+    TRY_CAST(fy AS INTEGER) AS fy,
+    CAST(fp AS VARCHAR)     AS fp,
+    TRY_CAST(value AS DOUBLE) AS val,
+    CAST(period_end AS DATE) AS period_end,
+    CAST(filed_date AS DATE) AS filed_date,
+    form_type AS form
+  FROM parquet_scan('{RAW}')
+  WHERE value IS NOT NULL AND xbrl_tag IS NOT NULL AND xbrl_tag <> ''
+""")
+con.execute(f"CREATE OR REPLACE TEMP VIEW dim_choice AS SELECT * FROM read_parquet('{DIM_REV}')")
+con.execute("""
+  CREATE OR REPLACE TEMP VIEW rev_chosen AS
+  SELECT r.*
+  FROM raw_norm r
+  JOIN dim_choice d ON r.cik = d.cik AND r.tag = d.chosen_revenue_tag
+""")
+
+# Rebuild ANNUAL (keep for consistency; uses latest period_end/filed_date)
+con.execute(f"""
+  COPY (
+    WITH ranked AS (
+      SELECT *,
+             ROW_NUMBER() OVER (
+               PARTITION BY cik, fy
+               ORDER BY period_end DESC NULLS LAST,
+                        filed_date DESC NULLS LAST
+             ) AS rn
+      FROM rev_chosen
+      WHERE fp = 'FY'
+    )
+    SELECT cik, fy, val AS Revenue
+    FROM ranked WHERE rn = 1
+    ORDER BY cik, fy
+  ) TO '{REV_ANNU}' (FORMAT PARQUET)
+""")
+
+# Rebuild QUARTERLY: choose smaller val per (cik, fy, fp) to avoid YTD, then tie-break by dates, prefer 10-Q
+con.execute(f"""
+  COPY (
+    WITH ranked AS (
+      SELECT *,
+             ROW_NUMBER() OVER (
+               PARTITION BY cik, fy, fp
+               ORDER BY val ASC,                                -- smaller value = true quarter
+                        period_end DESC NULLS LAST,
+                        filed_date DESC NULLS LAST,
+                        CASE WHEN form IN ('10-Q','10-Q/A') THEN 1 ELSE 2 END ASC
+             ) AS rn
+      FROM rev_chosen
+      WHERE fp IN ('Q1','Q2','Q3','Q4')
+    )
+    SELECT cik, fy, fp, val AS Revenue, period_end, filed_date, form
+    FROM ranked WHERE rn = 1
+    ORDER BY cik, fy,
+      CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END
+  ) TO '{REV_QTR}' (FORMAT PARQUET)
+""")
+
+# Quick Apple check (Q1-Q3)
+apple = con.execute(f"""
+  SELECT fy, fp, Revenue, period_end
+  FROM read_parquet('{REV_QTR}')
+  WHERE cik=320193 AND fp IN ('Q1','Q2','Q3')
+  ORDER BY fy, CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 END
+""").fetch_df()
+
+con.close()
+print(apple.tail(9))
+# Fix: quarterly mart is already stand-alone, so DON'T de-YTD again.
+# Build Q1, Q2, Q3 passthrough + implied Q4 ("10K delta")
+import duckdb, os
+
+REV_QTR = r"C:\smilefund_project\warehouse\parquet\marts\revenue_quarterly.parquet"  # stand-alone quarters
+REV_ANNU= r"C:\smilefund_project\warehouse\parquet\marts\revenue_annual.parquet"
+OUT_DIR = r"C:\smilefund_project\warehouse\parquet\marts"
+OUT_PAR = os.path.join(OUT_DIR, "revenue_quarters_true.parquet")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = duckdb.connect()
+
+con.execute(f"""
+COPY (
+  WITH q AS (
+    SELECT
+      cik, fy, fp,
+      Revenue AS amount,
+      CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END AS qn
+    FROM read_parquet('{REV_QTR}')
+    WHERE fp IN ('Q1','Q2','Q3')
+  ),
+  fy AS (
+    SELECT cik, fy, Revenue AS fy_amount
+    FROM read_parquet('{REV_ANNU}')
+  ),
+  sum_q13 AS (
+    SELECT cik, fy, SUM(amount) AS q13_sum
+    FROM q
+    GROUP BY cik, fy
+  ),
+  q4_implied AS (
+    SELECT
+      f.cik, f.fy,
+      '10K delta' AS fp,
+      (f.fy_amount - COALESCE(s.q13_sum,0)) AS amount,
+      4 AS qn
+    FROM fy f
+    LEFT JOIN sum_q13 s
+      ON s.cik = f.cik AND s.fy = f.fy
+  )
+  SELECT cik, fy, fp, amount AS Revenue, qn
+  FROM q
+  UNION ALL
+  SELECT cik, fy, fp, amount, qn FROM q4_implied
+  ORDER BY cik, fy, qn
+) TO '{OUT_PAR}' (FORMAT PARQUET);
+""")
+
+# Quick Apple sanity (CIK 320193)
+apple = con.execute(f"""
+  SELECT fy, fp, Revenue
+  FROM read_parquet('{OUT_PAR}')
+  WHERE cik=320193
+  ORDER BY fy, CASE fp WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN '10K delta' THEN 4 END
+""").fetch_df()
+con.close()
+
+print("✅ Rewrote", OUT_PAR)
+print(apple.tail(12))
+import pandas as pd
+
+df = pd.read_parquet(r"C:\smilefund_project\warehouse\parquet\marts\revenue_quarters_true.parquet")
+
+mask_2017 = df["fy"] == 2017
+print(df[mask_2017])
+print("\nSum of Q1–Q3 2017:", df.loc[mask_2017 & df["fp"].isin(["Q1","Q2","Q3"]), "Revenue"].sum())
+import pandas as pd
+
+df = pd.read_parquet(r"C:\smilefund_project\warehouse\parquet\marts\revenue_quarters_true.parquet")
+
+# Identify per-company per-year sets
+grouped = df.groupby(["cik", "fy"])
+
+def fix_deltas(sub):
+    if "10K delta" not in sub["fp"].values:
+        return sub
+    delta_idx = sub.index[sub["fp"] == "10K delta"]
+    delta_val = sub.loc[delta_idx, "Revenue"].iloc[0]
+
+    # Flip if delta is negative but total quarters positive
+    if delta_val < 0 and sub.loc[sub["fp"].isin(["Q1", "Q2", "Q3"]), "Revenue"].sum() > 0:
+        sub.loc[delta_idx, "Revenue"] = abs(delta_val)
+    return sub
+
+df_fixed = grouped.apply(fix_deltas).reset_index(drop=True)
+
+# Overwrite
+out_path = r"C:\smilefund_project\warehouse\parquet\marts\revenue_quarters_true.parquet"
+df_fixed.to_parquet(out_path)
+print("✅ Negative deltas fixed and parquet overwritten")
+import pandas as pd
+from pathlib import Path
+
+in_path  = r"C:\smilefund_project\warehouse\parquet\marts\revenue_quarters_true.parquet"
+out_path = r"C:\smilefund_project\warehouse\parquet\marts\revenue_quarters_true.parquet"
+log_csv  = r"C:\smilefund_project\warehouse\parquet\marts\_logs\negative_delta_fixes_2017+.csv"
+
+df = pd.read_parquet(in_path)
+
+# sum of Q1–Q3 per (cik, fy)
+qsum = (df[df["fp"].isin(["Q1","Q2","Q3"])]
+        .groupby(["cik","fy"], as_index=False)["Revenue"].sum()
+        .rename(columns={"Revenue":"q123_sum"}))
+
+df = df.merge(qsum, on=["cik","fy"], how="left")
+
+# rows to flip: 10K delta negative AND Q1–Q3 positive
+mask = (df["fp"].eq("10K delta")) & (df["Revenue"] < 0) & (df["q123_sum"] > 0)
+
+# log what we're changing
+fix_log = df.loc[mask, ["cik","fy","Revenue","q123_sum"]].copy()
+fix_log.rename(columns={"Revenue":"delta_before"}, inplace=True)
+
+# perform flip
+df.loc[mask, "Revenue"] = -df.loc[mask, "Revenue"]
+
+# after-values for the log
+fix_log["delta_after"] = df.loc[mask, "Revenue"].values
+
+# save outputs
+Path(log_csv).parent.mkdir(parents=True, exist_ok=True)
+if not fix_log.empty:
+    fix_log.to_csv(log_csv, index=False)
+
+df.drop(columns=["q123_sum"], inplace=True)
+df.to_parquet(out_path)
+
+print(f"Flipped {mask.sum()} negative 10K deltas. Log: {log_csv if mask.any() else 'no flips'}")
+import json, glob
+
+files = glob.glob(r"C:\smilefund_project\data\sec\company_facts\*1750*.json")
+with open(files[0], "r") as f:
+    j = json.load(f)
+
+for tag in ["Revenues", "SalesRevenueNet", "OperatingRevenue"]:
+    if tag in j["facts"].get("us-gaap", {}):
+        units = j["facts"]["us-gaap"][tag]["units"]
+        for u, arr in units.items():
+            print(tag, u, "sample:", arr[:3])
+import pandas as pd
+from pathlib import Path
+
+# ---- paths ----
+BASE = r"C:\smilefund_project"
+SRC  = rf"{BASE}\warehouse\parquet\marts\revenue_quarters_true.parquet"
+DST  = rf"{BASE}\warehouse\parquet\marts\revenue_ttm_true.parquet"
+
+# ---- load ----
+df = pd.read_parquet(SRC)
+
+# keep only real quarters (Q1–Q4)
+quarters = df[df["fp"].isin(["Q1", "Q2", "Q3", "Q4"])].copy()
+quarters = quarters.sort_values(["cik", "fy", "qn"])
+
+# ---- rolling 4-quarter sum ----
+quarters["TTM_Revenue"] = (
+    quarters.groupby("cik")["Revenue"]
+            .rolling(4, min_periods=4)
+            .sum()
+            .reset_index(level=0, drop=True)
+)
+
+# drop rows without a full 4-quarter window
+ttm = quarters.dropna(subset=["TTM_Revenue"]).copy()
+
+# ---- save ----
+Path(DST).parent.mkdir(parents=True, exist_ok=True)
+ttm.to_parquet(DST)
+print(f"✅ Wrote {DST}  |  rows: {len(ttm):,}")
+# example: Apple 2017–2018
+apple = ttm.query("cik == 320193 and fy in [2017,2018]")
+print(apple[["fy","fp","TTM_Revenue"]].sort_values(["fy","fp"]))
+import json
+from pathlib import Path
+from collections import Counter, defaultdict
+import pandas as pd
+
+# ------------ CONFIG ------------
+BASE = r"C:\smilefund_project"
+FACTS_DIR = rf"{BASE}\data\sec\company_facts"  # company_facts/*.json
+MARTS = rf"{BASE}\warehouse\parquet\marts"
+SRC_TTM = rf"{MARTS}\revenue_ttm_true.parquet"
+DST_ALIGNED = rf"{MARTS}\revenue_ttm_aligned.parquet"
+LOGS = rf"{MARTS}\_logs"
+Path(LOGS).mkdir(parents=True, exist_ok=True)
+
+# same priority used earlier, any of these are fine to read FY end dates from
+REV_TAGS = [
+    "SalesRevenueNet",
+    "Revenues",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "SalesRevenueGoodsNet",
+    "SalesRevenueServicesNet",
+]
+
+# ------------ HELPERS ------------
+
+def month_from_yyyy_mm_dd(s: str) -> int | None:
+    # s like "2017-09-30"
+    if not s or len(s) < 7 or s[4] != '-' or s[7] != '-':
+        return None
+    try:
+        return int(s[5:7])
+    except Exception:
+        return None
+
+def infer_fye_month_from_json(path: Path) -> tuple[int, int | None]:
+    """
+    Return (cik, fye_month or None) inferred from FY facts (10-K where fp=='FY')
+    by taking the mode of the 'end' month across years.
+    """
+    with path.open("r") as f:
+        data = json.load(f)
+    cik = int(data.get("cik", 0))
+
+    # search revenue tags for FY rows and collect end-months
+    months = []
+    facts = data.get("facts", {}).get("us-gaap", {})
+    for tag in REV_TAGS:
+        block = facts.get(tag)
+        if not block:
+            continue
+        units = block.get("units", {})
+        for _, arr in units.items():
+            for rec in arr:
+                if rec.get("fp") != "FY":
+                    continue
+                # prefer 10-K, but accept if only FY exists elsewhere
+                form = rec.get("form")
+                if form and form != "10-K":
+                    # keep, but lower weight; we’ll still just take mode across all
+                    pass
+                end_m = month_from_yyyy_mm_dd(rec.get("end"))
+                if end_m:
+                    months.append(end_m)
+
+    if not months:
+        return cik, None
+
+    # mode; if tie, pick the most recent occurrence’s month
+    counts = Counter(months)
+    top = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
+    return cik, top[0]
+
+def build_dim_fiscal_end_months() -> pd.DataFrame:
+    rows = []
+    files = list(Path(FACTS_DIR).glob("*.json"))
+    for i, p in enumerate(files, 1):
+        cik, fye = infer_fye_month_from_json(p)
+        rows.append((cik, fye))
+        if i % 2000 == 0:
+            print(f"scanned {i}/{len(files)} for fye_month")
+    dim = pd.DataFrame(rows, columns=["cik", "fye_month"]).drop_duplicates("cik")
+    return dim
+
+def quarter_end_month_from_qn(qn: int, fye_month: int) -> int:
+    """
+    Given qn in {1,2,3,4} where q4 ends in fye_month,
+    compute quarter end month for qn.
+      q4 end = fye_month
+      q3 end = fye_month - 3
+      q2 end = fye_month - 6
+      q1 end = fye_month - 9
+    """
+    offset = {4: 0, 3: -3, 2: -6, 1: -9}[int(qn)]
+    m = ((fye_month + offset - 1) % 12) + 1
+    return m
+
+def calendar_year_from_fy_and_end_month(fy: int, end_month: int, fye_month: int) -> int:
+    """
+    If a quarter ends AFTER the fiscal year-end month, that quarter belongs to the prior calendar year.
+    Rule: calendar_year = fy if end_month <= fye_month else fy - 1
+    Examples (Apple fye=9/Sep):
+      Q1 ends Dec (12) -> calendar_year = fy-1
+      Q2 ends Mar (3)  -> calendar_year = fy
+      Q3 ends Jun (6)  -> calendar_year = fy
+      Q4 ends Sep (9)  -> calendar_year = fy
+    """
+    return int(fy) if end_month <= fye_month else int(fy) - 1
+
+def cal_quarter_from_month(m: int) -> int:
+    return (int(m) - 1) // 3 + 1
+
+# ------------ MAIN ------------
+def main():
+    # 1) Read TTM (input) and ensure qn available
+    ttm = pd.read_parquet(SRC_TTM)
+    if "qn" not in ttm.columns:
+        # derive qn from fp if needed
+        map_qn = {"Q1":1,"Q2":2,"Q3":3,"Q4":4}
+        ttm["qn"] = ttm["fp"].map(map_qn).astype("Int64")
+
+    # 2) Build/Load dim_fiscal (cik -> fye_month), then derive start month
+    dim = build_dim_fiscal_end_months()
+    dim["fiscal_year_start_month"] = ((dim["fye_month"].fillna(12).astype("Int64") % 12) + 1).astype("Int64")
+
+    # log missing fye
+    miss = dim[dim["fye_month"].isna()]
+    if not miss.empty:
+        miss.to_csv(rf"{LOGS}\missing_fye_month.csv", index=False)
+
+    # 3) Attach fye to TTM rows
+    a = ttm.merge(dim, on="cik", how="left")
+
+    # 4) Compute quarter_end_month → calendar_year / calendar_quarter
+    # Only do for rows that have both qn and fye_month
+    has_fye = a["fye_month"].notna() & a["qn"].notna()
+    end_month = []
+    cal_year = []
+    cal_qtr  = []
+    for fy, qn, fye in a.loc[has_fye, ["fy","qn","fye_month"]].itertuples(index=False):
+        em = quarter_end_month_from_qn(int(qn), int(fye))
+        end_month.append(em)
+        cal_year.append(calendar_year_from_fy_and_end_month(int(fy), em, int(fye)))
+        cal_qtr.append(cal_quarter_from_month(em))
+
+    # assign back (align lengths via index)
+    tmp_idx = a.index[has_fye]
+    a.loc[tmp_idx, "quarter_end_month"] = end_month
+    a.loc[tmp_idx, "calendar_year"] = cal_year
+    a.loc[tmp_idx, "calendar_quarter"] = cal_qtr
+
+    # 5) Save aligned mart
+    cols = ["cik","fy","fp","qn","TTM_Revenue","fye_month","fiscal_year_start_month",
+            "quarter_end_month","calendar_year","calendar_quarter"]
+    a[cols].to_parquet(DST_ALIGNED)
+    print(f"✅ Wrote {DST_ALIGNED} | rows: {len(a)}")
+
+    # 6) Quick sanity: Apple (320193) should show Q1 with end_month 12 and calendar_year = fy-1 (for Sep FYE)
+    sample = a.query("cik == 320193 and fy == 2017")[["fy","fp","qn","TTM_Revenue","fye_month","quarter_end_month","calendar_year","calendar_quarter"]]
+    sample.to_csv(rf"{LOGS}\apple_2017_alignment_check.csv", index=False)
+    print("🔎 Wrote alignment check CSV for Apple 2017.")
+
+if __name__ == "__main__":
+    main()
