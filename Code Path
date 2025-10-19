@@ -4972,3 +4972,89 @@ print(chk(104169))
 
 print("\nTop 5 by TTM:")
 print(vw.sort_values("ttm_revenue", ascending=False)[["ticker","company_name","ttm_cal_year","ttm_revenue"]].head(5))
+import pandas as pd
+a = pd.read_parquet(r"C:\smilefund_project\warehouse\parquet\marts\revenue_ttm_aligned.parquet")
+len(a)
+def last3(a, cik):
+    r = a.loc[a["cik"]==cik, ["fy","fp","qn","TTM_Revenue","calendar_year"]]
+    return r.sort_values(["calendar_year","qn"]).tail(3)
+
+print("Walmart (104169):\n", last3(a, 104169))
+print("\nApple (320193):\n", last3(a, 320193))
+import pandas as pd
+from pathlib import Path
+
+BASE  = r"C:\smilefund_project"
+MARTS = rf"{BASE}\warehouse\parquet\marts"
+
+# --- Load aligned TTM ---
+a = pd.read_parquet(rf"{MARTS}\revenue_ttm_aligned.parquet")
+
+# --- Step 3: Year-over-year growth ---
+aa = a.dropna(subset=["calendar_year","qn","TTM_Revenue"]).copy()
+aa["calendar_year"] = aa["calendar_year"].astype(int)
+aa["qn"] = aa["qn"].astype(int)
+
+# Keep only last TTM of each calendar year
+last_ttm = (
+    aa.sort_values(["cik","calendar_year","qn"])
+      .groupby(["cik","calendar_year"], as_index=False)
+      .last()[["cik","calendar_year","TTM_Revenue"]]
+      .rename(columns={"TTM_Revenue":"TTM"})
+)
+
+# Prior-year lookup
+prior = last_ttm.copy()
+prior["calendar_year"] = prior["calendar_year"] + 1
+prior = prior.rename(columns={"TTM":"TTM_prior"})
+
+yoy = last_ttm.merge(prior, on=["cik","calendar_year"], how="left")
+yoy["YoY_Growth"] = (yoy["TTM"] - yoy["TTM_prior"]) / yoy["TTM_prior"]
+yoy.loc[yoy["TTM_prior"].isna() | (yoy["TTM_prior"] == 0), "YoY_Growth"] = pd.NA
+
+out_yoy = rf"{MARTS}\revenue_yoy_true.parquet"
+yoy.to_parquet(out_yoy)
+print(f"✅ wrote {out_yoy} | rows: {len(yoy):,}")
+
+# --- Step 4: Mapped view with tickers ---
+dim  = pd.read_parquet(rf"{MARTS}\dim_security.parquet")
+
+# latest TTM per CIK
+last_ttm_overall = (
+    a.sort_values(["cik","calendar_year","qn"])
+     .groupby("cik", as_index=False)
+     .last()[["cik","calendar_year","calendar_quarter","TTM_Revenue"]]
+     .rename(columns={
+         "calendar_year":"ttm_cal_year",
+         "calendar_quarter":"ttm_cal_quarter",
+         "TTM_Revenue":"ttm_revenue"
+     })
+)
+
+vw = (
+    dim.merge(last_ttm_overall, on="cik", how="left")
+       .merge(yoy[["cik","calendar_year","YoY_Growth"]]
+              .rename(columns={"calendar_year":"ttm_cal_year"}), 
+              on=["cik","ttm_cal_year"], how="left")
+)
+
+out_vw = rf"{MARTS}\vw_mapped_with_ttm.parquet"
+vw.to_parquet(out_vw)
+print(f"✅ wrote {out_vw} | rows: {len(vw):,}")
+print("Null tickers:", vw['ticker'].isna().sum())
+print("Null ttm_revenue:", vw['ttm_revenue'].isna().sum())
+print("Null YoY_Growth:", vw['YoY_Growth'].isna().sum())
+
+# --- sanity: Apple and Walmart ---
+def show(cik):
+    r = vw.loc[vw["cik"]==cik, ["ticker","company_name","ttm_cal_year","ttm_revenue","YoY_Growth"]]
+    return r.tail(3)
+
+print("\nWalmart (104169):")
+print(show(104169))
+
+print("\nApple (320193):")
+print(show(320193))
+
+print("\nTop 5 by TTM:")
+print(vw.sort_values("ttm_revenue", ascending=False)[["ticker","company_name","ttm_cal_year","ttm_revenue","YoY_Growth"]].head(5))
