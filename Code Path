@@ -4356,3 +4356,579 @@ dim = dim.drop_duplicates(subset=["cik"])
 dim.to_parquet(OUTP)
 print(f"✅ Wrote {OUTP} | rows: {len(dim):,}")
 print(dim.head(10))
+import pandas as pd
+from pathlib import Path
+
+BASE  = r"C:\smilefund_project"
+MARTS = rf"{BASE}\warehouse\parquet\marts"
+
+dim  = pd.read_parquet(rf"{MARTS}\dim_security.parquet")
+ttm  = pd.read_parquet(rf"{MARTS}\revenue_ttm_aligned.parquet")
+
+# Keep only CIKs that have TTM rows to avoid a huge null join
+keep_ciks = set(ttm["cik"].unique())
+dim = dim[dim["cik"].isin(keep_ciks)].copy()
+
+# Latest TTM per CIK (by calendar_year then quarter)
+last_ttm = (ttm.sort_values(["cik","calendar_year","qn"])
+              .groupby("cik", as_index=False)
+              .last()[["cik","calendar_year","calendar_quarter","TTM_Revenue"]])
+
+vw = (dim.merge(last_ttm, on="cik", how="left")
+          .rename(columns={
+              "calendar_year": "ttm_cal_year",
+              "calendar_quarter": "ttm_cal_quarter",
+              "TTM_Revenue": "ttm_revenue"
+          }))
+
+outp = rf"{MARTS}\vw_holdings_with_ttm.parquet"
+Path(MARTS).mkdir(parents=True, exist_ok=True)
+vw.to_parquet(outp)
+
+print(f"✅ wrote {outp} | rows: {len(vw):,}")
+print("Null ttm_revenue rows:", vw["ttm_revenue"].isna().sum())
+
+# quick spot-checks
+print("\nApple preview:")
+print(vw.query("cik == 320193")[["cik","company_name","ticker","ttm_cal_year","ttm_cal_quarter","ttm_revenue"]].head())
+
+print("\nRandom sample:")
+print(vw.sample(5, random_state=42)[["cik","company_name","ticker","ttm_cal_year","ttm_revenue"]])
+!pip install openpyxl
+import os
+import pandas as pd
+from pathlib import Path
+
+BASE  = r"C:\smilefund_project"
+MARTS = rf"{BASE}\warehouse\parquet\marts"
+LOGS  = rf"{MARTS}\_logs"
+Path(LOGS).mkdir(parents=True, exist_ok=True)
+
+dim_path   = rf"{MARTS}\dim_security.parquet"
+map_xlsx   = rf"{BASE}\data\sec\ticker_map.xlsx"   # your file
+map_csv    = rf"{BASE}\data\sec\ticker_map.csv"    # fallback if you saved as CSV
+
+# --- load dim_security ---
+dim = pd.read_parquet(dim_path)
+
+# --- load your ticker map (xlsx or csv) ---
+if os.path.exists(map_xlsx):
+    tick = pd.read_excel(map_xlsx)
+elif os.path.exists(map_csv):
+    tick = pd.read_csv(map_csv)
+else:
+    raise FileNotFoundError("Couldn't find ticker_map.xlsx or ticker_map.csv in data\\sec")
+
+# --- normalize columns (accept 'cik' or '_cik') ---
+cols_lower = {c.lower(): c for c in tick.columns}
+cik_col     = cols_lower.get("cik") or cols_lower.get("_cik")
+ticker_col  = cols_lower.get("ticker")
+if cik_col is None or ticker_col is None:
+    raise RuntimeError(f"Expected columns 'ticker' and 'cik' (or '_cik'). Got: {list(tick.columns)}")
+
+tick = tick.rename(columns={cik_col: "cik", ticker_col: "ticker"})
+
+# --- clean values ---
+tick["cik"] = pd.to_numeric(tick["cik"], errors="coerce").astype("Int64")
+tick = tick.dropna(subset=["cik"])
+tick["ticker"] = (tick["ticker"].astype(str)
+                              .str.upper()
+                              .str.strip()
+                              .str.replace("-", ".", regex=False))   # e.g., BRK-B -> BRK.B
+
+# --- log duplicate CIKs in your map (if any) and keep the first occurrence ---
+dup_mask = tick.duplicated(subset=["cik"], keep=False)
+if dup_mask.any():
+    tick.loc[dup_mask].to_csv(rf"{LOGS}\ticker_map_duplicates.csv", index=False)
+    print(f"⚠️ Duplicates found in your ticker map; logged to {LOGS}\\ticker_map_duplicates.csv")
+tick = tick.drop_duplicates(subset=["cik"], keep="first")
+
+# --- merge into dim_security (your map takes precedence) ---
+dim_upd = dim.merge(tick[["cik","ticker"]], on="cik", how="left", suffixes=("", "_map"))
+dim_upd["ticker"] = dim_upd["ticker_map"].combine_first(dim_upd["ticker"])
+dim_upd = dim_upd.drop(columns=["ticker_map"])
+
+# --- save ---
+dim_upd.to_parquet(dim_path)
+print(f"✅ Updated {dim_path} with {len(tick):,} mapped tickers.")
+
+# quick spot-checks (AAPL, MSFT if present)
+for c in [320193, 789019]:
+    row = dim_upd.loc[dim_upd["cik"] == c, ["cik","company_name","ticker"]]
+    if not row.empty:
+        print(row)
+import pandas as pd
+from pathlib import Path
+
+BASE  = r"C:\smilefund_project"
+MARTS = rf"{BASE}\warehouse\parquet\marts"
+
+dim = pd.read_parquet(rf"{MARTS}\dim_security.parquet")
+ttm = pd.read_parquet(rf"{MARTS}\revenue_ttm_aligned.parquet")
+
+last_ttm = (ttm.sort_values(["cik","calendar_year","qn"])
+              .groupby("cik", as_index=False)
+              .last()[["cik","calendar_year","calendar_quarter","TTM_Revenue"]])
+
+vw = (dim.merge(last_ttm, on="cik", how="left")
+          .rename(columns={
+              "calendar_year":"ttm_cal_year",
+              "calendar_quarter":"ttm_cal_quarter",
+              "TTM_Revenue":"ttm_revenue"
+          }))
+
+outp = rf"{MARTS}\vw_holdings_with_ttm.parquet"
+vw.to_parquet(outp)
+
+print(f"✅ wrote {outp} | rows: {len(vw):,}")
+print("Null ticker rows:", vw["ticker"].isna().sum())
+print("Null ttm_revenue rows:", vw["ttm_revenue"].isna().sum())
+
+# quick preview (Apple/MSFT if present)
+print(vw.query("cik == 320193")[['cik','company_name','ticker','ttm_cal_year','ttm_revenue']].head())
+print(vw.query("cik == 789019")[['cik','company_name','ticker','ttm_cal_year','ttm_revenue']].head())
+import os
+import pandas as pd
+from pathlib import Path
+
+BASE  = r"C:\smilefund_project"
+MARTS = rf"{BASE}\warehouse\parquet\marts"
+MAP_XLSX = rf"{BASE}\data\sec\ticker_map.xlsx"
+MAP_CSV  = rf"{BASE}\data\sec\ticker_map.csv"
+
+dim = pd.read_parquet(rf"{MARTS}\dim_security.parquet")
+ttm = pd.read_parquet(rf"{MARTS}\revenue_ttm_aligned.parquet")
+
+# load your map (xlsx or csv)
+if os.path.exists(MAP_XLSX):
+    tick = pd.read_excel(MAP_XLSX)
+elif os.path.exists(MAP_CSV):
+    tick = pd.read_csv(MAP_CSV)
+else:
+    raise FileNotFoundError("ticker_map.xlsx or ticker_map.csv not found in data\\sec")
+
+# normalize columns/values
+cols_lower = {c.lower(): c for c in tick.columns}
+cik_col    = cols_lower.get("cik") or cols_lower.get("_cik")
+ticker_col = cols_lower.get("ticker")
+tick = tick.rename(columns={cik_col:"cik", ticker_col:"ticker"})
+tick["cik"] = pd.to_numeric(tick["cik"], errors="coerce").astype("Int64")
+tick["ticker"] = (tick["ticker"].astype(str).str.upper().str.strip()
+                  .str.replace("-", ".", regex=False))
+tick = tick.dropna(subset=["cik"]).drop_duplicates(subset=["cik"])
+
+# restrict to mapped CIKs only
+dim_mapped = dim.merge(tick, on="cik", how="inner", suffixes=("_dim",""))
+
+# latest TTM per cik
+last_ttm = (ttm.sort_values(["cik","calendar_year","qn"])
+              .groupby("cik", as_index=False)
+              .last()[["cik","calendar_year","calendar_quarter","TTM_Revenue"]])
+
+vw = (dim_mapped.merge(last_ttm, on="cik", how="left")
+        .rename(columns={
+            "calendar_year":"ttm_cal_year",
+            "calendar_quarter":"ttm_cal_quarter",
+            "TTM_Revenue":"ttm_revenue"
+        }))
+
+outp = rf"{MARTS}\vw_mapped_with_ttm.parquet"
+vw.to_parquet(outp)
+
+print(f"✅ wrote {outp} | rows: {len(vw):,}")
+print("Null ticker rows (should be 0):", vw["ticker"].isna().sum())
+print("Null ttm_revenue rows:", vw["ttm_revenue"].isna().sum())
+
+# previews
+print("\nApple:")
+print(vw.query("cik == 320193")[["cik","company_name","ticker","ttm_cal_year","ttm_revenue"]].head())
+print("\nTop 5 by TTM:")
+print(vw.sort_values("ttm_revenue", ascending=False)[["ticker","company_name","ttm_cal_year","ttm_revenue"]].head(5))
+import json, glob
+
+for cik in [1163653, 104169, 320193, 789019, 1318605]:  # NMR, WMT, AAPL, MSFT, AMZN (examples)
+    f = glob.glob(fr"C:\smilefund_project\data\sec\company_facts\*{cik}*.json")
+    if not f:
+        print(f"Missing CIK {cik}")
+        continue
+    data = json.load(open(f[0], "r"))
+    facts = data.get("facts", {}).get("us-gaap", {})
+    for tag in ["Revenues", "SalesRevenueNet", "RevenueFromContractWithCustomerExcludingAssessedTax"]:
+        if tag in facts:
+            units = list(facts[tag]["units"].keys())
+            print(f"{data['entityName']:<35} {tag:<55} {units}")
+import pandas as pd
+
+FX = {
+    "JPY": 0.0068,
+    "JPYMillions": 0.0068 * 1_000_000,
+    "JPYm": 0.0068 * 1_000_000,
+    "EUR": 1.08,
+    "EURm": 1.08 * 1_000_000,
+    "CNY": 0.14,
+    "USD": 1.0,
+    "USDm": 1_000_000,
+    "USDmillions": 1_000_000
+}
+
+fx_table = pd.DataFrame(list(FX.items()), columns=["unit","usd_multiplier"])
+fx_table.to_parquet(r"C:\smilefund_project\warehouse\parquet\marts\dim_fx_rates.parquet")
+# ===================== SEC → Revenue (USD-only) → Phase B (TTM/YoY) =====================
+# Rebuilds everything cleanly with ONLY USD units:
+# - marts/revenue_quarters_true.parquet
+# - marts/revenue_ttm_true.parquet
+# - marts/revenue_ttm_aligned.parquet
+# - marts/revenue_yoy_true.parquet
+#
+# Logs: marts/_logs/*
+# ========================================================================================
+
+import os, json
+from collections import Counter
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+import pandas as pd
+
+# --------------------- CONFIG ---------------------
+BASE   = r"C:\smilefund_project"
+FACTS  = rf"{BASE}\data\sec\company_facts"              # *.json from SEC
+OUT    = rf"{BASE}\warehouse\parquet"
+MARTS  = rf"{OUT}\marts"
+LOGS   = rf"{MARTS}\_logs"
+
+Path(MARTS).mkdir(parents=True, exist_ok=True)
+Path(LOGS).mkdir(parents=True, exist_ok=True)
+
+# Revenue tags to consider (priority order)
+REV_TAGS: List[str] = [
+    "SalesRevenueNet",
+    "Revenues",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "SalesRevenueGoodsNet",
+    "SalesRevenueServicesNet",
+]
+
+# Accept only USD-denominated units (strict) and scale them properly
+USD_UNITS_MULT: Dict[str, int] = {
+    "USD": 1,
+    "USD$": 1,              # rare alias
+    "USDthousands": 1_000,
+    "USDThousands": 1_000,  # alias
+    "USDm": 1_000_000,
+    "USDmillions": 1_000_000,
+    "USDMillions": 1_000_000,
+}
+
+# --------------------- HELPERS ---------------------
+def load_company_file(path: Path) -> Tuple[int, dict]:
+    with path.open("r") as f:
+        data = json.load(f)
+    cik = int(data.get("cik", 0))
+    return cik, data
+
+def iter_revenue_facts_usd(cik: int, data: dict) -> Iterable[Dict]:
+    """
+    Yield revenue facts but KEEP ONLY USD units to avoid non-USD scale issues.
+    """
+    facts = data.get("facts", {}).get("us-gaap", {})
+    for tag in REV_TAGS:
+        block = facts.get(tag)
+        if not block:
+            continue
+        units = block.get("units", {})
+        for unit_name, arr in units.items():
+            if unit_name not in USD_UNITS_MULT:
+                continue  # *** USD-only filter ***
+            mult = USD_UNITS_MULT[unit_name]
+            for rec in arr:
+                # typical keys present in SEC JSON:
+                # start, end, val, accn, fy, fp, form, filed, frame
+                val = rec.get("val")
+                fy  = rec.get("fy")
+                fp  = rec.get("fp")     # 'Q1','Q2','Q3','Q4','FY' etc.
+                form= rec.get("form")   # '10-Q' or '10-K' usually
+                filed = rec.get("filed")
+
+                if val is None or fy is None or fp is None or form is None:
+                    continue
+
+                try:
+                    value = float(val) * mult
+                except Exception:
+                    continue
+
+                yield {
+                    "cik": cik,
+                    "tag": tag,
+                    "unit": unit_name,
+                    "fy": int(fy),
+                    "fp": str(fp),
+                    "form": str(form),
+                    "filed": str(filed) if filed else None,
+                    "Revenue": value,
+                }
+
+def choose_best_per_period(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    From all candidate facts, choose one value per (cik, fy, fp) using:
+      1) form priority (10-K for FY; 10-Q for Q1–Q4)
+      2) tag priority (REV_TAGS order)
+      3) latest filed date as tiebreaker
+    """
+    def form_rank(fp: str, form: str) -> int:
+        if fp == "FY":
+            return 0 if form == "10-K" else 1
+        return 0 if form == "10-Q" else 1
+
+    tag_rank = {t: i for i, t in enumerate(REV_TAGS)}
+
+    df = df.copy()
+    df["form_rank"] = df.apply(lambda r: form_rank(r["fp"], r["form"]), axis=1)
+    df["tag_rank"]  = df["tag"].map(tag_rank).fillna(9999)
+    df["filed_dt"]  = pd.to_datetime(df["filed"], errors="coerce")
+
+    df = df.sort_values(
+        ["cik","fy","fp","form_rank","tag_rank","filed_dt"],
+        ascending=[True, True, True, True, True, True]
+    )
+    best = df.drop_duplicates(subset=["cik","fy","fp"], keep="first")
+    return best[["cik","fy","fp","Revenue","tag","unit","form","filed"]]
+
+def build_quarters_and_delta(best: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build Q1..Q3 rows and a 10K delta row per (cik, fy):
+        delta = FY(10-K) - (Q1 + Q2 + Q3)
+    If Q4 exists as a quarter, we ignore it in favor of the delta pattern you’ve been using.
+    """
+    qtrs = best[best["fp"].isin(["Q1","Q2","Q3","Q4"])].copy()
+    ann  = best[(best["fp"] == "FY") & (best["form"] == "10-K")].copy()
+
+    # Sum of Q1..Q3
+    q123 = (qtrs[qtrs["fp"].isin(["Q1","Q2","Q3"])]
+              .groupby(["cik","fy"], as_index=False)["Revenue"].sum()
+              .rename(columns={"Revenue": "Q123"}))
+
+    merged = ann.merge(q123, on=["cik","fy"], how="inner", validate="one_to_one")
+    merged["delta"] = merged["Revenue"] - merged["Q123"]
+
+    delta_rows = merged[["cik","fy","delta"]].copy()
+    delta_rows["fp"] = "10K delta"
+    delta_rows.rename(columns={"delta":"Revenue"}, inplace=True)
+
+    q_keep = qtrs[qtrs["fp"].isin(["Q1","Q2","Q3"])][["cik","fy","fp","Revenue"]].copy()
+
+    out = pd.concat([q_keep, delta_rows[["cik","fy","fp","Revenue"]]], ignore_index=True)
+
+    fp_to_qn = {"Q1":1,"Q2":2,"Q3":3,"10K delta":4}
+    out["qn"] = out["fp"].map(fp_to_qn).astype("Int64")
+    out = out.sort_values(["cik","fy","qn"]).reset_index(drop=True)
+    return out
+
+def flip_negative_deltas(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flip obviously negative deltas where Q1–Q3 sum > 0 and delta < 0 (likely sign error in tag mixing).
+    Log all flips.
+    """
+    qsum = (df[df["fp"].isin(["Q1","Q2","Q3"])]
+              .groupby(["cik","fy"], as_index=False)["Revenue"].sum()
+              .rename(columns={"Revenue":"Q123"}))
+    x = df.merge(qsum, on=["cik","fy"], how="left")
+    mask = (x["fp"].eq("10K delta")) & (x["Revenue"] < 0) & (x["Q123"] > 0)
+
+    flips = x.loc[mask, ["cik","fy","Revenue","Q123"]].copy()
+    if not flips.empty:
+        flips.rename(columns={"Revenue":"delta_before"}, inplace=True)
+        idx = x.index[mask]
+        x.loc[idx, "Revenue"] = -x.loc[idx, "Revenue"]
+        flips["delta_after"] = x.loc[idx, "Revenue"].values
+        flips.to_csv(rf"{LOGS}\negative_delta_fixes.csv", index=False)
+
+    x = x.drop(columns=["Q123"])
+    return x
+
+def month_from_yyyy_mm_dd(s: str) -> int | None:
+    if not s or len(s) < 7 or s[4] != '-' or s[7] != '-':
+        return None
+    try:
+        return int(s[5:7])
+    except Exception:
+        return None
+
+def infer_fye_month_from_json(path: Path) -> Tuple[int, int | None]:
+    """
+    Infer fiscal-year-end month from FY rows' 'end' date across revenue tags; take mode.
+    """
+    with path.open("r") as f:
+        data = json.load(f)
+    cik = int(data.get("cik", 0))
+
+    months = []
+    facts = data.get("facts", {}).get("us-gaap", {})
+    for tag in REV_TAGS:
+        blk = facts.get(tag)
+        if not blk: 
+            continue
+        for unit_name, arr in blk.get("units", {}).items():
+            # We only care about USD units here for consistency (but end month is independent of unit)
+            for rec in arr:
+                if rec.get("fp") != "FY":
+                    continue
+                end_m = month_from_yyyy_mm_dd(rec.get("end"))
+                if end_m:
+                    months.append(end_m)
+
+    if not months:
+        return cik, None
+
+    counts = Counter(months)
+    top = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
+    return cik, top[0]
+
+def quarter_end_month_from_qn(qn: int, fye_month: int) -> int:
+    # q4 ends at fye_month; q3 = fye-3; q2 = fye-6; q1 = fye-9
+    offset = {4:0, 3:-3, 2:-6, 1:-9}[int(qn)]
+    return ((fye_month + offset - 1) % 12) + 1
+
+def calendar_year_from_fy(fy: int, q_end_month: int, fye_month: int) -> int:
+    # If the quarter-end month is AFTER the FYE month, it belongs to prior calendar year; else current FY.
+    return int(fy) if q_end_month <= fye_month else int(fy) - 1
+
+def cal_quarter_from_month(m: int) -> int:
+    return (int(m) - 1) // 3 + 1
+
+# --------------------- MAIN BUILD ---------------------
+def main():
+    # ------- Phase A: Read JSON → USD-only revenue rows -------
+    files = list(Path(FACTS).glob("*.json"))
+    if not files:
+        raise RuntimeError(f"No JSON files found in {FACTS}")
+
+    rows = []
+    for i, p in enumerate(files, 1):
+        try:
+            cik, data = load_company_file(p)
+            for rec in iter_revenue_facts_usd(cik, data):
+                rows.append(rec)
+        except Exception:
+            pass
+        if i % 2000 == 0:
+            print(f"scanned {i}/{len(files)} company_facts (USD-only)")
+
+    raw = pd.DataFrame(rows)
+    if raw.empty:
+        raise RuntimeError("No USD revenue facts found. Check FACTS dir and USD units list.")
+
+    # keep only recognizable fiscal periods
+    raw = raw[raw["fp"].isin(["Q1","Q2","Q3","Q4","FY"])]
+
+    # choose best per (cik, fy, fp)
+    best = choose_best_per_period(raw)
+
+    # Build Q1..Q3 + 10K delta
+    rq = build_quarters_and_delta(best)
+
+    # Flip negative deltas (log)
+    rq = flip_negative_deltas(rq)
+
+    # Save Phase A mart
+    path_quarters = rf"{MARTS}\revenue_quarters_true.parquet"
+    rq.to_parquet(path_quarters)
+    print(f"✅ Wrote {path_quarters} — rows: {len(rq):,}")
+
+    # Sanity logs
+    n_neg = (rq.query('fp == "10K delta"')["Revenue"] < 0).sum()
+    dups  = rq.duplicated(["cik","fy","fp"]).sum()
+    print(f"Sanity — negative deltas: {n_neg} | duplicates: {dups}")
+
+    # ------- Phase B Step 1: TTM (rolling 4Q, exclude delta) -------
+    q = rq[rq["fp"].isin(["Q1","Q2","Q3","Q4"])].copy()
+    # if qn not present for Q4 (we didn't set one earlier), set it now
+    map_qn = {"Q1":1,"Q2":2,"Q3":3,"Q4":4}
+    q["qn"] = q["fp"].map(map_qn).astype("Int64")
+    q = q.sort_values(["cik","fy","qn"])
+
+    q["TTM_Revenue"] = (
+        q.groupby("cik")["Revenue"]
+         .rolling(4, min_periods=4)
+         .sum()
+         .reset_index(level=0, drop=True)
+    )
+    ttm = q.dropna(subset=["TTM_Revenue"]).copy()
+    path_ttm = rf"{MARTS}\revenue_ttm_true.parquet"
+    ttm.to_parquet(path_ttm)
+    print(f"✅ Wrote {path_ttm} — rows: {len(ttm):,}")
+
+    # ------- Phase B Step 2: Fiscal ↔ Calendar alignment -------
+    # infer FYE month per CIK from JSON FY 'end' dates
+    fye_rows = []
+    for i, p in enumerate(files, 1):
+        try:
+            cik, fye = infer_fye_month_from_json(p)
+            fye_rows.append((cik, fye))
+        except Exception:
+            pass
+        if i % 2000 == 0:
+            print(f"inferred FYE for {i}/{len(files)} companies")
+
+    dim_fye = pd.DataFrame(fye_rows, columns=["cik","fye_month"]).drop_duplicates("cik")
+    dim_fye["fiscal_year_start_month"] = ((dim_fye["fye_month"].fillna(12).astype("Int64") % 12) + 1).astype("Int64")
+    dim_fye.to_parquet(rf"{MARTS}\dim_fiscal_year_end.parquet")
+
+    a = ttm.merge(dim_fye, on="cik", how="left")
+
+    # compute quarter_end_month, calendar_year, calendar_quarter
+    has_fye = a["fye_month"].notna() & a["qn"].notna()
+    end_month, cal_year, cal_quarter = [], [], []
+    for fy, qn, fye in a.loc[has_fye, ["fy","qn","fye_month"]].itertuples(index=False):
+        em = quarter_end_month_from_qn(int(qn), int(fye))
+        end_month.append(em)
+        cy = calendar_year_from_fy(int(fy), em, int(fye))
+        cal_year.append(cy)
+        cal_quarter.append(cal_quarter_from_month := ((em - 1)//3 + 1))
+
+    idx = a.index[has_fye]
+    a.loc[idx, "quarter_end_month"] = end_month
+    a.loc[idx, "calendar_year"]     = cal_year
+    a.loc[idx, "calendar_quarter"]  = cal_quarter
+
+    path_align = rf"{MARTS}\revenue_ttm_aligned.parquet"
+    a.to_parquet(path_align)
+    print(f"✅ Wrote {path_align} — rows: {len(a):,}")
+
+    # ------- Phase B Step 3: YoY (by calendar year, last quarter) -------
+    aa = a.dropna(subset=["calendar_year","qn","TTM_Revenue"]).copy()
+    aa["calendar_year"] = aa["calendar_year"].astype(int)
+    aa["qn"] = aa["qn"].astype(int)
+
+    last_ttm = (
+        aa.sort_values(["cik","calendar_year","qn"])
+          .groupby(["cik","calendar_year"], as_index=False)
+          .last()[["cik","calendar_year","TTM_Revenue"]]
+          .rename(columns={"TTM_Revenue":"TTM"})
+    )
+    prior = last_ttm.copy()
+    prior["calendar_year"] = prior["calendar_year"] + 1
+    prior = prior.rename(columns={"TTM":"TTM_prior"})
+
+    yoy = last_ttm.merge(prior, on=["cik","calendar_year"], how="left")
+    yoy["YoY_Growth"] = (yoy["TTM"] - yoy["TTM_prior"]) / yoy["TTM_prior"]
+    yoy.loc[yoy["TTM_prior"].isna(), "YoY_Growth"] = pd.NA
+    yoy.loc[yoy["TTM_prior"] == 0, "YoY_Growth"]   = pd.NA
+
+    path_yoy = rf"{MARTS}\revenue_yoy_true.parquet"
+    yoy.to_parquet(path_yoy)
+    print(f"✅ Wrote {path_yoy} — rows: {len(yoy):,}")
+
+    # ------- Final sanity prints -------
+    # Apple check (if present)
+    try:
+        apple_ttm = aa.query("cik == 320193")[["fy","fp","qn","TTM_Revenue","calendar_year"]].sort_values(["fy","qn"]).tail(6)
+        print("\nApple TTM preview:\n", apple_ttm.head(6))
+        apple_yoy = yoy.query("cik == 320193 and calendar_year in [2016,2017,2018]").sort_values("calendar_year")
+        print("\nApple YoY preview:\n", apple_yoy)
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    main()
