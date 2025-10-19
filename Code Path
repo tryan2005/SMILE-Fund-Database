@@ -4204,3 +4204,98 @@ def main():
 
 if __name__ == "__main__":
     main()
+import pandas as pd
+from pathlib import Path
+
+BASE = r"C:\smilefund_project"
+MARTS = rf"{BASE}\warehouse\parquet\marts"
+SRC   = rf"{MARTS}\revenue_ttm_aligned.parquet"
+DST   = rf"{MARTS}\revenue_yoy_true.parquet"
+LOGS  = rf"{MARTS}\_logs"
+
+Path(LOGS).mkdir(parents=True, exist_ok=True)
+
+# 1) Load aligned TTM
+a = pd.read_parquet(SRC)
+
+# safety: drop rows without calendar_year/qn
+a = a.dropna(subset=["calendar_year", "qn", "TTM_Revenue"]).copy()
+a["calendar_year"] = a["calendar_year"].astype(int)
+a["qn"] = a["qn"].astype(int)
+
+# 2) Take the LAST TTM per (cik, calendar_year) — i.e., the quarter with the max qn in that year
+last_ttm = (a.sort_values(["cik","calendar_year","qn"])
+              .groupby(["cik","calendar_year"], as_index=False)
+              .last()[["cik","calendar_year","TTM_Revenue"]]
+              .rename(columns={"TTM_Revenue":"TTM"}))
+
+# 3) Join prior year
+prior = last_ttm.copy()
+prior["calendar_year"] = prior["calendar_year"] + 1  # shift forward to align prior with current year
+prior = prior.rename(columns={"TTM":"TTM_prior"})
+
+yoy = last_ttm.merge(prior, on=["cik","calendar_year"], how="left")
+
+# 4) Compute YoY, handle div-by-zero cleanly
+yoy["YoY_Growth"] = (yoy["TTM"] - yoy["TTM_prior"]) / yoy["TTM_prior"]
+yoy.loc[yoy["TTM_prior"].isna(), "YoY_Growth"] = pd.NA  # first available year => NA
+yoy.loc[yoy["TTM_prior"] == 0, "YoY_Growth"] = pd.NA    # avoid inf
+
+# 5) Save YoY mart
+yoy.to_parquet(DST)
+print(f"✅ Wrote {DST} | rows: {len(yoy):,}")
+
+# 6) Logs: rows with no prior
+no_prior = yoy[yoy["TTM_prior"].isna()][["cik","calendar_year","TTM"]]
+if not no_prior.empty:
+    no_prior.to_csv(rf"{LOGS}\revenue_yoy_missing_prior.csv", index=False)
+    print(f"🔎 Logged missing prior years → {LOGS}\\revenue_yoy_missing_prior.csv")
+
+# 7) Quick sanity: Apple sample
+apple = yoy.query("cik == 320193 and calendar_year in [2016,2017,2018]").sort_values("calendar_year")
+print("Apple YoY preview:\n", apple)
+import pandas as pd
+from pathlib import Path
+
+BASE = r"C:\smilefund_project"
+MARTS = rf"{BASE}\warehouse\parquet\marts"
+
+q = pd.read_parquet(rf"{MARTS}\revenue_quarters_true.parquet")
+ttm = pd.read_parquet(rf"{MARTS}\revenue_ttm_aligned.parquet")
+yoy = pd.read_parquet(rf"{MARTS}\revenue_yoy_true.parquet")
+
+# quarters (Q1–Q3 + 10K delta)
+fact_q = (q.assign(metric="revenue",
+                   measure="quarter",
+                   is_ttm=False, is_yoy=False)
+            .rename(columns={"Revenue":"value"}))[["cik","fy","fp","qn","metric","measure","value","is_ttm","is_yoy"]]
+
+# TTM (aligned → has calendar_year/quarter)
+fact_ttm = (ttm.assign(metric="revenue",
+                       measure="ttm",
+                       is_ttm=True, is_yoy=False)
+              .rename(columns={"TTM_Revenue":"value"}))[["cik","fy","fp","qn","calendar_year","calendar_quarter",
+                                                        "metric","measure","value","is_ttm","is_yoy"]]
+
+# YoY (per calendar_year)
+fact_yoy = (yoy.assign(metric="revenue",
+                       measure="yoy",
+                       fp="FY", qn=4,  # anchor YoY to year-end for convenience
+                       is_ttm=True, is_yoy=True)
+              .rename(columns={"TTM":"value","YoY_Growth":"yoy"}))[["cik","calendar_year","metric","measure","value","yoy","is_ttm","is_yoy"]]
+
+# write
+Path(MARTS).mkdir(parents=True, exist_ok=True)
+fact_q.to_parquet(rf"{MARTS}\fact_financials_quarters.parquet")
+fact_ttm.to_parquet(rf"{MARTS}\fact_financials_ttm.parquet")
+fact_yoy.to_parquet(rf"{MARTS}\fact_financials_yoy.parquet")
+
+# optional: single unioned table
+fact_all = pd.concat([
+    fact_q.assign(calendar_year=pd.NA, calendar_quarter=pd.NA),
+    fact_ttm,
+    fact_yoy.assign(fy=pd.NA, fp=pd.NA, qn=pd.NA)
+], ignore_index=True)
+
+fact_all.to_parquet(rf"{MARTS}\fact_financials_standard.parquet")
+print("✅ wrote fact_financials_standard.parquet")
