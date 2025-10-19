@@ -4299,3 +4299,60 @@ fact_all = pd.concat([
 
 fact_all.to_parquet(rf"{MARTS}\fact_financials_standard.parquet")
 print("✅ wrote fact_financials_standard.parquet")
+import json, os
+from pathlib import Path
+import pandas as pd
+
+BASE   = r"C:\smilefund_project"
+FACTS  = rf"{BASE}\data\sec\company_facts"      # folder of *.json
+MARTS  = rf"{BASE}\warehouse\parquet\marts"
+OUTP   = rf"{MARTS}\dim_security.parquet"
+
+Path(MARTS).mkdir(parents=True, exist_ok=True)
+
+rows = []
+files = list(Path(FACTS).glob("*.json"))
+if not files:
+    raise RuntimeError(f"No JSON files found in {FACTS}")
+
+for i, p in enumerate(files, 1):
+    try:
+        with p.open("r") as f:
+            data = json.load(f)
+        cik = int(data.get("cik", 0))
+        name = data.get("entityName") or data.get("entityNameSic") or ""
+        # some files include "ticker" at the top level; keep if present
+        ticker = (data.get("ticker") or data.get("tickers") or None)
+        # normalize "tickers" list to a single string if needed
+        if isinstance(ticker, list) and ticker:
+            ticker = str(ticker[0])
+        rows.append({"cik": cik, "ticker": ticker, "company_name": name})
+    except Exception:
+        # skip unreadable files
+        pass
+    if i % 2000 == 0:
+        print(f"scanned {i}/{len(files)} company_facts")
+
+dim = pd.DataFrame(rows)
+if dim.empty:
+    raise RuntimeError("Parsed 0 companies from company_facts JSON.")
+
+# clean & dedupe
+dim["cik"] = pd.to_numeric(dim["cik"], errors="coerce").astype("Int64")
+dim = dim.dropna(subset=["cik"])
+dim["ticker"] = dim["ticker"].astype(str).str.upper().str.strip()
+dim.loc[dim["ticker"].isin(["NONE","NAN","<NA>",""]), "ticker"] = pd.NA
+dim["company_name"] = (dim["company_name"].astype(str)
+                       .str.replace(r'[^A-Za-z0-9 &\.-]+', ' ', regex=True)
+                       .str.replace(r'\s+', ' ', regex=True)
+                       .str.strip())
+
+# If you want to restrict to only CIKs that actually appear in your TTM file, uncomment:
+# ttm = pd.read_parquet(rf"{MARTS}\revenue_ttm_aligned.parquet")
+# keep_ciks = set(ttm["cik"].unique().tolist())
+# dim = dim[dim["cik"].isin(keep_ciks)]
+
+dim = dim.drop_duplicates(subset=["cik"])
+dim.to_parquet(OUTP)
+print(f"✅ Wrote {OUTP} | rows: {len(dim):,}")
+print(dim.head(10))
