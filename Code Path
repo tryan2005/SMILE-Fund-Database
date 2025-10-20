@@ -5445,3 +5445,80 @@ print(show(104169))
 
 print("\nApple (320193):")
 print(show(320193))
+import pandas as pd
+
+MARTS = r"C:\smilefund_project\warehouse\parquet\marts"
+CIK_WMT = 104169
+
+# 1) What our pipeline used (CALENDAR YoY from TTM)
+a = pd.read_parquet(rf"{MARTS}\netincome_ttm_aligned.parquet")  # <-- use revenue_ttm_aligned.parquet if checking revenue
+w = a[a.cik == CIK_WMT].sort_values(["calendar_year","qn"])
+cal_last = (w.dropna(subset=["calendar_year","qn","TTM_NetIncome"])  # <-- TTM_Revenue if revenue
+             .assign(calendar_year=lambda d: d["calendar_year"].astype(int),
+                     qn=lambda d: d["qn"].astype(int))
+             .sort_values(["calendar_year","qn"])
+             .groupby(["cik","calendar_year"], as_index=False)
+             .last()[["cik","calendar_year","TTM_NetIncome"]])      # <-- TTM_Revenue if revenue
+cal_last = cal_last.rename(columns={"TTM_NetIncome":"TTM"})          # <-- TTM_Revenue -> TTM
+
+cal_prior = cal_last.rename(columns={"TTM":"TTM_prior","calendar_year":"calendar_year_prior"})
+cal_prior["calendar_year"] = cal_prior["calendar_year_prior"] + 1
+cal_yoy = (cal_last.merge(cal_prior[["cik","calendar_year","TTM_prior"]],
+                          on=["cik","calendar_year"], how="left")
+                   .assign(YoY_Calendar=(cal_last["TTM"]-cal_prior["TTM_prior"])/cal_prior["TTM_prior"]))
+
+print("=== Calendar TTM YoY we used ===")
+print(cal_yoy.tail(5))
+
+# 2) Fiscal-year YoY (sum Q1–Q3 + 10K delta = FY), then compare FY(t) vs FY(t-1)
+q = pd.read_parquet(rf"{MARTS}\netincome_quarters_true.parquet")     # <-- revenue_quarters_true.parquet if revenue
+qw = q[q.cik == CIK_WMT]
+fy_tot = (qw.pivot_table(index=["cik","fy"], columns="fp", values="NetIncome", aggfunc="sum")  # <-- Revenue if revenue
+            .fillna(0))
+# FY total = Q1+Q2+Q3 + 10K delta  (this reconstructs the 10-K FY value)
+fy_tot["FY_total"] = fy_tot.get("Q1",0)+fy_tot.get("Q2",0)+fy_tot.get("Q3",0)+fy_tot.get("10K delta",0)
+fy_tot = fy_tot.reset_index()[["cik","fy","FY_total"]].sort_values("fy")
+
+fy_prior = fy_tot.rename(columns={"FY_total":"FY_prior","fy":"fy_prior"})
+fy_prior["fy"] = fy_prior["fy_prior"] + 1
+fy_yoy = (fy_tot.merge(fy_prior[["cik","fy","FY_prior"]], on=["cik","fy"], how="left")
+                .assign(YoY_Fiscal=(fy_tot["FY_total"]-fy_prior["FY_prior"])/fy_prior["FY_prior"]))
+
+print("\n=== Fiscal 10-K YoY (reconstructed) ===")
+print(fy_yoy.tail(5))
+
+# 3) Convenience: show the specific year you're questioning
+target_years = cal_yoy["calendar_year"].dropna().astype(int).sort_values().tail(2).tolist()
+print("\nComparing the most recent two calendar years used for YoY:")
+print(cal_yoy[cal_yoy["calendar_year"].isin(target_years)])
+import pandas as pd
+
+MARTS = r"C:\smilefund_project\warehouse\parquet\marts"
+
+# reload last_ttm from existing aligned file
+a = pd.read_parquet(rf"{MARTS}\netincome_ttm_aligned.parquet")
+aa = a.dropna(subset=["calendar_year","qn","TTM_NetIncome"]).copy()
+aa["calendar_year"] = aa["calendar_year"].astype(int)
+aa["qn"] = aa["qn"].astype(int)
+
+last_ttm = (
+    aa.sort_values(["cik","calendar_year","qn"])
+      .groupby(["cik","calendar_year"], as_index=False)
+      .last()[["cik","calendar_year","TTM_NetIncome"]]
+      .rename(columns={"TTM_NetIncome":"TTM"})
+)
+prior = last_ttm.copy()
+prior["calendar_year"] = prior["calendar_year"] + 1
+prior = prior.rename(columns={"TTM":"TTM_prior"})
+
+yoy = last_ttm.merge(prior, on=["cik","calendar_year"], how="left")
+yoy["YoY_Growth"] = (
+    (yoy["TTM"].astype(float) - yoy["TTM_prior"].astype(float))
+    / yoy["TTM_prior"].astype(float)
+)
+yoy.loc[yoy["TTM_prior"].isna() | (yoy["TTM_prior"] == 0), "YoY_Growth"] = pd.NA
+
+out_yoy = rf"{MARTS}\netincome_yoy_true.parquet"
+yoy.to_parquet(out_yoy)
+print(f"✅ Re-wrote {out_yoy} — rows: {len(yoy):,}")
+print(yoy[yoy.cik == 104169].tail(3))  # Walmart check
