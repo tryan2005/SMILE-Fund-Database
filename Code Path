@@ -5299,3 +5299,149 @@ ni_ttm = q.dropna(subset=["TTM_NetIncome"]).copy()
 out_ttm = rf"{MARTS}\netincome_ttm_true.parquet"
 ni_ttm.to_parquet(out_ttm)
 print(f"✅ Wrote {out_ttm} — rows: {len(ni_ttm):,}")
+# ===================== Net Income — Align → YoY → Mapped View =====================
+import os, json
+from collections import Counter
+from pathlib import Path
+import pandas as pd
+
+BASE   = r"C:\smilefund_project"
+FACTS  = rf"{BASE}\data\sec\company_facts"
+MARTS  = rf"{BASE}\warehouse\parquet\marts"
+
+# ---- 0) Load TTM (from your previous step) ----
+ni_ttm = pd.read_parquet(rf"{MARTS}\netincome_ttm_true.parquet")
+
+# ---- 1) Get fiscal year-end months (reuse if available; else infer) ----
+dim_fye_path = rf"{MARTS}\dim_fiscal_year_end.parquet"
+if os.path.exists(dim_fye_path):
+    dim_fye = pd.read_parquet(dim_fye_path)
+else:
+    # Fallback inference (use revenue tags; FY 'end' dates are reliable there)
+    REV_TAGS = [
+        "SalesRevenueNet",
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueGoodsNet",
+        "SalesRevenueServicesNet",
+    ]
+    def month_from_yyyy_mm_dd(s):
+        try:
+            return int(s[5:7]) if s and len(s) >= 7 else None
+        except:
+            return None
+
+    def infer_fye_month(path: Path):
+        data = json.load(open(path, "r"))
+        cik = int(data.get("cik", 0))
+        months = []
+        facts = data.get("facts", {}).get("us-gaap", {})
+        for tag in REV_TAGS:
+            blk = facts.get(tag)
+            if not blk: continue
+            for _, arr in blk.get("units", {}).items():
+                for rec in arr:
+                    if rec.get("fp") == "FY":
+                        m = month_from_yyyy_mm_dd(rec.get("end"))
+                        if m: months.append(m)
+        if not months: 
+            return cik, None
+        c = Counter(months)
+        return cik, max(c.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+    files = list(Path(FACTS).glob("*.json"))
+    rows = []
+    for i, p in enumerate(files, 1):
+        try: rows.append(infer_fye_month(p))
+        except: pass
+    dim_fye = pd.DataFrame(rows, columns=["cik","fye_month"]).drop_duplicates("cik")
+    dim_fye["fiscal_year_start_month"] = ((dim_fye["fye_month"].fillna(12).astype("Int64") % 12) + 1).astype("Int64")
+    dim_fye.to_parquet(dim_fye_path)
+
+# ---- 2) Align TTM to calendar year/quarter ----
+def quarter_end_month_from_qn(qn, fye):
+    return ((int(fye) + {4:0,3:-3,2:-6,1:-9}[int(qn)] - 1) % 12) + 1
+def cal_quarter(m): 
+    return (int(m)-1)//3 + 1
+def cal_year(fy, end_m, fye_m):
+    return int(fy) if int(end_m) <= int(fye_m) else int(fy) - 1
+
+a = ni_ttm.merge(dim_fye, on="cik", how="left")
+
+mask = a["fye_month"].notna() & a["qn"].notna()
+end_month, cal_years, cal_quarters = [], [], []
+for fy, qn, fye in a.loc[mask, ["fy","qn","fye_month"]].itertuples(index=False):
+    em = quarter_end_month_from_qn(qn, fye)
+    end_month.append(em)
+    cal_years.append(cal_year(fy, em, fye))
+    cal_quarters.append(cal_quarter(em))
+idx = a.index[mask]
+a.loc[idx, "quarter_end_month"] = end_month
+a.loc[idx, "calendar_year"]     = cal_years
+a.loc[idx, "calendar_quarter"]  = cal_quarters
+
+out_align = rf"{MARTS}\netincome_ttm_aligned.parquet"
+a.to_parquet(out_align)
+print(f"✅ Wrote {out_align} — rows: {len(a):,}")
+
+# ---- 3) YoY (use last TTM of each calendar year) ----
+aa = a.dropna(subset=["calendar_year","qn","TTM_NetIncome"]).copy()
+aa["calendar_year"] = aa["calendar_year"].astype(int)
+aa["qn"] = aa["qn"].astype(int)
+
+last_ttm = (
+    aa.sort_values(["cik","calendar_year","qn"])
+      .groupby(["cik","calendar_year"], as_index=False)
+      .last()[["cik","calendar_year","TTM_NetIncome"]]
+      .rename(columns={"TTM_NetIncome":"TTM"})
+)
+prior = last_ttm.copy()
+prior["calendar_year"] = prior["calendar_year"] + 1
+prior = prior.rename(columns={"TTM":"TTM_prior"})
+
+yoy = last_ttm.merge(prior, on=["cik","calendar_year"], how="left")
+yoy["YoY_Growth"] = (yoy["TTM"] - yoy["TTM_prior"]) / yoy["TTM_prior"]
+yoy.loc[yoy["TTM_prior"].isna() | (yoy["TTM_prior"] == 0), "YoY_Growth"] = pd.NA
+
+out_yoy = rf"{MARTS}\netincome_yoy_true.parquet"
+yoy.to_parquet(out_yoy)
+print(f"✅ Wrote {out_yoy} — rows: {len(yoy):,}")
+
+# ---- 4) Mapped view with tickers (latest TTM + YoY) ----
+dim  = pd.read_parquet(rf"{MARTS}\dim_security.parquet")
+
+last_overall = (
+    a.sort_values(["cik","calendar_year","qn"])
+     .groupby("cik", as_index=False)
+     .last()[["cik","calendar_year","calendar_quarter","TTM_NetIncome"]]
+     .rename(columns={
+         "calendar_year":"ttm_cal_year",
+         "calendar_quarter":"ttm_cal_quarter",
+         "TTM_NetIncome":"ttm_netincome"
+     })
+)
+
+vw = (
+    dim.merge(last_overall, on="cik", how="left")
+       .merge(yoy[["cik","calendar_year","YoY_Growth"]]
+              .rename(columns={"calendar_year":"ttm_cal_year"}), 
+              on=["cik","ttm_cal_year"], how="left")
+)
+
+out_vw = rf"{MARTS}\vw_mapped_with_ttm_netincome.parquet"
+vw.to_parquet(out_vw)
+print(f"✅ Wrote {out_vw} | rows: {len(vw):,}")
+print("Null tickers:", vw["ticker"].isna().sum())
+print("Null ttm_netincome:", vw["ttm_netincome"].isna().sum())
+print("Null YoY_Growth:", vw["YoY_Growth"].isna().sum())
+
+# ---- 5) Quick sanity checks (Walmart & Apple) ----
+def show(cik):
+    r = vw.loc[vw["cik"]==cik, ["ticker","company_name","ttm_cal_year","ttm_netincome","YoY_Growth"]]
+    return r.tail(3)
+
+print("\nWalmart (104169):")
+print(show(104169))
+
+print("\nApple (320193):")
+print(show(320193))
